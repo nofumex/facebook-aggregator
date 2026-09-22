@@ -1,0 +1,32 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Test application
+        run: go test ./...
+      - name: Test vendored Facebook fork
+        working-directory: third_party/facebook-go
+        run: go test ./groups
+      - name: Vet
+        run: go vet ./...
+      - name: Vulnerability scan
+        uses: golang/govulncheck-action@v1
+        with:
+          go-package: ./...
+      - name: Build
+        run: go build ./cmd/...

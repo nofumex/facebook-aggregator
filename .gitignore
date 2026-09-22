@@ -1,0 +1,15 @@
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+credentials.json
+secrets.json
+*.log
+coverage.out
+bin/
+dist/
+.idea/
+.vscode/
