@@ -14,19 +14,27 @@ type Benchmarks struct {
 }
 type Weights struct{ RelativeRent, PriceM2, Area, Bedrooms, District, Furnishing, Beach, Amenities, Utilities, Freshness, Evidence float64 }
 type RankingConfig struct {
-	Base                          float64
-	Weights                       Weights
-	District, Bedroom, AreaBucket map[string]float64
-	Furnishing                    map[string]float64
+	Base                                                                                                                        float64
+	Weights                                                                                                                     Weights
+	District, Bedroom, AreaBucket                                                                                               map[string]float64
+	Furnishing                                                                                                                  map[string]float64
+	RelativeScale, BeachBase, BeachDistanceMax, BeachMinimum, AmenitiesTarget, UtilityDisclosure, GovernmentRate, FreshnessDays float64
+	ConfidenceCoverage, ConfidenceExtraction, ConfidenceComparables, ComparableTarget                                           float64
+	CoverageWeights                                                                                                             map[string]float64
 }
 type Engine struct{ Config RankingConfig }
 
 func DefaultConfig() RankingConfig {
 	return RankingConfig{
-		Base:     50,
-		Weights:  Weights{RelativeRent: 26, PriceM2: 12, Area: 3, Bedrooms: 3, District: 3, Furnishing: 4, Beach: 4, Amenities: 4, Utilities: 2, Freshness: 3, Evidence: 5},
-		District: map[string]float64{}, Bedroom: map[string]float64{}, AreaBucket: map[string]float64{},
-		Furnishing: map[string]float64{"full": .5, "partial": .2, "none": 0},
+		Base:          50,
+		Weights:       Weights{RelativeRent: 26, PriceM2: 12, Area: 3, Bedrooms: 3, District: 3, Furnishing: 4, Beach: 4, Amenities: 4, Utilities: 2, Freshness: 3, Evidence: 5},
+		District:      map[string]float64{domain.DistrictSonTra: .04, domain.DistrictNguHanhSon: .04, domain.DistrictHaiChau: .02, domain.DistrictThanhKhe: 0, domain.DistrictLienChieu: 0, domain.DistrictCamLe: 0, domain.DistrictHoaVang: 0, domain.DistrictOther: -.02, domain.DistrictUnknown: -.04},
+		Bedroom:       map[string]float64{"studio": .02, "1": .04, "2": .03, "3+": 0, "unknown": -.03},
+		AreaBucket:    map[string]float64{"<25": -.03, "25-35": .01, "35-50": .04, "50-70": .03, "70+": .01, "unknown": -.03},
+		Furnishing:    map[string]float64{"full": .5, "partial": .2, "none": 0},
+		RelativeScale: .35, BeachBase: .5, BeachDistanceMax: 3000, BeachMinimum: .1, AmenitiesTarget: 6, UtilityDisclosure: .2, GovernmentRate: .3, FreshnessDays: 30,
+		ConfidenceCoverage: .55, ConfidenceExtraction: .25, ConfidenceComparables: .20, ComparableTarget: 40,
+		CoverageWeights: map[string]float64{"price": .25, "district": .15, "property_type": .12, "bedrooms": .12, "area_m2": .16, "furnished": .05, "location_original": .05},
 	}
 }
 func New() Engine                          { return Engine{Config: DefaultConfig()} }
@@ -42,20 +50,20 @@ func (e Engine) Score(l domain.Listing, b Benchmarks, now time.Time) (float64, f
 	w := c.Weights
 	score := c.Base
 	if l.RentMin != nil && b.MedianRent > 0 {
-		score += w.RelativeRent * clamp((b.MedianRent-float64(*l.RentMin))/(b.MedianRent*.35), -1, 1)
+		score += w.RelativeRent * clamp((b.MedianRent-float64(*l.RentMin))/(b.MedianRent*c.RelativeScale), -1, 1)
 	}
 	if l.RentMin != nil && l.AreaM2 != nil && *l.AreaM2 > 0 && b.MedianPriceM2 > 0 {
 		ppm := float64(*l.RentMin) / *l.AreaM2
-		score += w.PriceM2 * clamp((b.MedianPriceM2-ppm)/(b.MedianPriceM2*.35), -1, 1)
+		score += w.PriceM2 * clamp((b.MedianPriceM2-ppm)/(b.MedianPriceM2*c.RelativeScale), -1, 1)
 	}
 	score += w.District * c.District[l.District]
 	score += w.Bedrooms * c.Bedroom[bedBucket(l.Bedrooms)]
 	score += w.Area * c.AreaBucket[areaBucket(l.AreaM2)]
 	score += w.Furnishing * c.Furnishing[l.Furnished]
 	if l.NearBeach != nil && *l.NearBeach {
-		v := .5
+		v := c.BeachBase
 		if l.BeachDistanceM != nil {
-			v = clamp(1-float64(*l.BeachDistanceM)/3000, .1, 1)
+			v = clamp(1-float64(*l.BeachDistanceM)/c.BeachDistanceMax, c.BeachMinimum, 1)
 		}
 		score += w.Beach * v
 	}
@@ -65,19 +73,19 @@ func (e Engine) Score(l domain.Listing, b Benchmarks, now time.Time) (float64, f
 			amenities++
 		}
 	}
-	score += w.Amenities * math.Min(float64(amenities)/6, 1)
+	score += w.Amenities * math.Min(float64(amenities)/c.AmenitiesTarget, 1)
 	if len(l.Utilities) > 0 {
-		score += w.Utilities * .2
+		score += w.Utilities * c.UtilityDisclosure
 	}
 	if gov, ok := l.Utilities["government_rate"].(bool); ok && gov {
-		score += w.Utilities * .3
+		score += w.Utilities * c.GovernmentRate
 	}
 	age := now.Sub(l.PublishedAt)
 	if age < 0 {
 		age = 0
 	}
-	score += w.Freshness * (2*math.Exp(-age.Hours()/(24*30)) - 1)
-	confidence := ScoreConfidence(l, b.SimilarCount)
+	score += w.Freshness * (2*math.Exp(-age.Hours()/(24*c.FreshnessDays)) - 1)
+	confidence := scoreConfidence(l, b.SimilarCount, c)
 	score += w.Evidence * (2*confidence - 1)
 	return round1(clamp(score, 0, 100)), math.Round(confidence*100) / 100
 }
@@ -85,12 +93,15 @@ func (e Engine) Score(l domain.Listing, b Benchmarks, now time.Time) (float64, f
 // ScoreConfidence = 0.55*weighted field coverage + 0.25*mean known-field
 // extraction confidence + 0.20*log-scaled comparable sample quality.
 func ScoreConfidence(l domain.Listing, sample int) float64 {
+	return scoreConfidence(l, sample, DefaultConfig())
+}
+func scoreConfidence(l domain.Listing, sample int, c RankingConfig) float64 {
 	type f struct {
 		known  bool
 		key    string
 		weight float64
 	}
-	fields := []f{{l.RentMin != nil, "price", .25}, {l.District != "" && l.District != "Unknown", "district", .15}, {l.PropertyType != "", "property_type", .12}, {l.Bedrooms != nil, "bedrooms", .12}, {l.AreaM2 != nil, "area_m2", .16}, {l.Furnished != "", "furnished", .05}, {l.LocationOriginal != "" || l.Ward != "" || l.Street != "", "location_original", .05}}
+	fields := []f{{l.RentMin != nil, "price", c.CoverageWeights["price"]}, {l.District != "" && l.District != domain.DistrictUnknown, "district", c.CoverageWeights["district"]}, {l.PropertyType != "", "property_type", c.CoverageWeights["property_type"]}, {l.Bedrooms != nil, "bedrooms", c.CoverageWeights["bedrooms"]}, {l.AreaM2 != nil, "area_m2", c.CoverageWeights["area_m2"]}, {l.Furnished != "", "furnished", c.CoverageWeights["furnished"]}, {l.LocationOriginal != "" || l.Ward != "" || l.Street != "", "location_original", c.CoverageWeights["location_original"]}}
 	coverage, total, quality, n := 0.0, 0.0, 0.0, 0.0
 	for _, x := range fields {
 		total += x.weight
@@ -110,8 +121,8 @@ func ScoreConfidence(l domain.Listing, sample int) float64 {
 	if n > 0 {
 		quality /= n
 	}
-	sampleQ := math.Min(math.Log1p(float64(sample))/math.Log1p(40), 1)
-	return clamp(.55*coverage+.25*quality+.20*sampleQ, 0, 1)
+	sampleQ := math.Min(math.Log1p(float64(sample))/math.Log1p(c.ComparableTarget), 1)
+	return clamp(c.ConfidenceCoverage*coverage+c.ConfidenceExtraction*quality+c.ConfidenceComparables*sampleQ, 0, 1)
 }
 func bedBucket(v *int) string {
 	if v == nil {

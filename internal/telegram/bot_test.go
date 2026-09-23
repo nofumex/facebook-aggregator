@@ -47,6 +47,25 @@ func TestMainMenuAndCardEditFlows(t *testing.T) {
 	}
 }
 
+func TestDistrictCallbacksStoreCanonicalValues(t *testing.T) {
+	var body map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		_, _ = io.WriteString(w, `{"ok":true,"result":{"message_id":1}}`)
+	}))
+	defer srv.Close()
+	b := testBot(srv)
+	q := &CallbackQuery{From: User{ID: 42}, Message: Message{Chat: Chat{ID: 1}, MessageID: 1}}
+	b.applyFilter(context.Background(), q, []string{"filter", "district", "Sơn Trà"})
+	if b.filters[42].District != "Son Tra" {
+		t.Fatalf("district=%q", b.filters[42].District)
+	}
+	raw, _ := json.Marshal(body["reply_markup"])
+	if !strings.Contains(string(raw), "filter:district:Son Tra") || strings.Contains(string(raw), "filter:district:Sơn Trà") {
+		t.Fatalf("markup=%s", raw)
+	}
+}
+
 func TestListingWithPhotoRenderedAsPhotoCard(t *testing.T) {
 	var calls []map[string]any
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

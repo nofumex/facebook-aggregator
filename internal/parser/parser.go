@@ -249,16 +249,7 @@ func propertyType(s string) string {
 	return ""
 }
 func district(s string) string {
-	districts := []struct {
-		name  string
-		words []string
-	}{{"Son Tra", []string{"sơn trà", "son tra"}}, {"Ngu Hanh Son", []string{"ngũ hành sơn", "ngu hanh son", "mỹ an", "my an", "an thượng", "an thuong", "khu fpt", "fpt complex"}}, {"Hai Chau", []string{"hải châu", "hai chau"}}, {"Thanh Khe", []string{"thanh khê", "thanh khe"}}, {"Lien Chieu", []string{"liên chiểu", "lien chieu"}}, {"Cam Le", []string{"cẩm lệ", "cam le"}}, {"Hoa Vang", []string{"hòa vang", "hoa vang"}}}
-	for _, d := range districts {
-		if containsAny(s, d.words...) {
-			return d.name
-		}
-	}
-	return ""
+	return domain.NormalizeDistrict(s)
 }
 func furnishing(s string) string {
 	switch {

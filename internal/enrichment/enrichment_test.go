@@ -61,7 +61,7 @@ func extractionServer(t *testing.T, malformedFirst bool) (*httptest.Server, *int
 		calls++
 		content := validJSON(4_500_000)
 		if malformedFirst && req.Model == "light" {
-			content = `{"broken":true}`
+			content = `{`
 		}
 		_ = json.NewEncoder(w).Encode(map[string]any{"choices": []any{map[string]any{"message": map[string]any{"content": content}}}, "usage": map[string]any{"prompt_tokens": 10, "completion_tokens": 20}})
 	}))
@@ -73,7 +73,7 @@ func TestCascadeFallbackAndFirstValidStops(t *testing.T) {
 		name      string
 		malformed bool
 		want      int
-	}{{"fallback", true, 3}, {"first valid", false, 1}} {
+	}{{"fallback", true, 2}, {"first valid", false, 1}} {
 		t.Run(tc.name, func(t *testing.T) {
 			srv, calls := extractionServer(t, tc.malformed)
 			defer srv.Close()
@@ -87,6 +87,85 @@ func TestCascadeFallbackAndFirstValidStops(t *testing.T) {
 				t.Fatalf("calls=%d want=%d", *calls, tc.want)
 			}
 		})
+	}
+}
+
+func TestTransientHTTPRetriesSameModel(t *testing.T) {
+	for _, status := range []int{http.StatusTooManyRequests, http.StatusInternalServerError} {
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			calls := 0
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path == "/models" {
+					_ = json.NewEncoder(w).Encode(map[string]any{"data": []any{map[string]any{"id": "light"}}})
+					return
+				}
+				calls++
+				if calls < 3 {
+					http.Error(w, "temporary", status)
+					return
+				}
+				_ = json.NewEncoder(w).Encode(map[string]any{"choices": []any{map[string]any{"message": map[string]any{"content": validJSON(4_500_000)}}}})
+			}))
+			defer srv.Close()
+			cfg := config.LLMExtraction{Enabled: true, BaseURL: srv.URL, APIKey: "x", Timeout: time.Second, Concurrency: 1, SchemaVersion: "v1", Models: []string{"light"}, RetryBase: time.Millisecond, MaxAttempts: 3}
+			got, ok, err := New(cfg, nil, nil).Apply(context.Background(), domain.Listing{OriginalText: "studio 4tr5", Confidence: domain.Confidence{}, RawValues: map[string]any{}})
+			if err != nil || !ok || got.RentMin == nil || calls != 3 {
+				t.Fatalf("calls=%d ok=%v err=%v got=%+v", calls, ok, err, got)
+			}
+		})
+	}
+}
+
+func TestNetworkErrorRetriesSameModel(t *testing.T) {
+	calls := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/models" {
+			_ = json.NewEncoder(w).Encode(map[string]any{"data": []any{map[string]any{"id": "light"}}})
+			return
+		}
+		calls++
+		if calls == 1 {
+			conn, _, _ := w.(http.Hijacker).Hijack()
+			_ = conn.Close()
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"choices": []any{map[string]any{"message": map[string]any{"content": validJSON(4_500_000)}}}})
+	}))
+	defer srv.Close()
+	cfg := config.LLMExtraction{Enabled: true, BaseURL: srv.URL, APIKey: "x", Timeout: time.Second, Concurrency: 1, SchemaVersion: "v1", Models: []string{"light"}, RetryBase: time.Millisecond, MaxAttempts: 3}
+	_, ok, err := New(cfg, nil, nil).Apply(context.Background(), domain.Listing{OriginalText: "studio 4tr5", Confidence: domain.Confidence{}, RawValues: map[string]any{}})
+	if err != nil || !ok || calls != 2 {
+		t.Fatalf("calls=%d ok=%v err=%v", calls, ok, err)
+	}
+}
+
+func TestInvalidEnumFallsBackWithoutSameModelRetry(t *testing.T) {
+	calls := map[string]int{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/models" {
+			_ = json.NewEncoder(w).Encode(map[string]any{"data": []any{map[string]any{"id": "light"}, map[string]any{"id": "strong"}}})
+			return
+		}
+		var req struct {
+			Model string `json:"model"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		calls[req.Model]++
+		content := validJSON(4_500_000)
+		if req.Model == "light" {
+			var obj map[string]any
+			_ = json.Unmarshal([]byte(content), &obj)
+			obj["district"] = "My An"
+			b, _ := json.Marshal(obj)
+			content = string(b)
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"choices": []any{map[string]any{"message": map[string]any{"content": content}}}})
+	}))
+	defer srv.Close()
+	cfg := config.LLMExtraction{Enabled: true, BaseURL: srv.URL, APIKey: "x", Timeout: time.Second, Concurrency: 1, SchemaVersion: "v1", Models: []string{"light", "strong"}, RetryBase: time.Millisecond, MaxAttempts: 3}
+	_, ok, err := New(cfg, nil, nil).Apply(context.Background(), domain.Listing{OriginalText: "studio", Confidence: domain.Confidence{}, RawValues: map[string]any{}})
+	if err != nil || !ok || calls["light"] != 1 || calls["strong"] != 1 {
+		t.Fatalf("calls=%v ok=%v err=%v", calls, ok, err)
 	}
 }
 
@@ -135,10 +214,34 @@ func TestSurchargeAndUtilitiesNeverBecomeRent(t *testing.T) {
 	rent, surcharge := int64(4_500_000), int64(300_000)
 	yes := true
 	district := "Ngu Hanh Son"
-	e := domain.Enrichment{IsRental:&yes,RentMinVND:&rent,District:&district,ForeignerSurcharge:&surcharge,Utilities:map[string]any{"electricity_vnd_per_kwh":float64(4000),"water_vnd_per_person":float64(100000)},Confidence:domain.Confidence{"rent_vnd":.99,"district":.9,"foreigner_surcharge_vnd":.95,"utilities":.95}}
-	got:=Merge(domain.Listing{Confidence:domain.Confidence{},RawValues:map[string]any{}},e)
-	if got.RentMin==nil||*got.RentMin!=rent||got.ForeignerPrice==nil||*got.ForeignerPrice!=surcharge{t.Fatalf("%+v",got)}
-	if got.Utilities["electricity_vnd_per_kwh"]!=float64(4000)||got.Utilities["water_vnd_per_person"]!=float64(100000){t.Fatalf("%+v",got.Utilities)}
+	e := domain.Enrichment{IsRental: &yes, RentMinVND: &rent, District: &district, ForeignerSurcharge: &surcharge, Utilities: map[string]any{"electricity_vnd_per_kwh": float64(4000), "water_vnd_per_person": float64(100000)}, Confidence: domain.Confidence{"rent_vnd": .99, "district": .9, "foreigner_surcharge_vnd": .95, "utilities": .95}}
+	got := Merge(domain.Listing{Confidence: domain.Confidence{}, RawValues: map[string]any{}}, e)
+	if got.RentMin == nil || *got.RentMin != rent || got.ForeignerPrice == nil || *got.ForeignerPrice != surcharge {
+		t.Fatalf("%+v", got)
+	}
+	if got.Utilities["electricity_vnd_per_kwh"] != float64(4000) || got.Utilities["water_vnd_per_person"] != float64(100000) {
+		t.Fatalf("%+v", got.Utilities)
+	}
 }
 
-func TestValidatorRejectsNonCanonicalDistrict(t *testing.T){yes:=true;district:="My An";err:=Validate(domain.Enrichment{IsRental:&yes,District:&district,Confidence:domain.Confidence{"is_rental_listing":.9}});if err==nil{t.Fatal("non-canonical district accepted")}}
+func TestValidatorRejectsNonCanonicalDistrict(t *testing.T) {
+	yes := true
+	district := "My An"
+	err := Validate(domain.Enrichment{IsRental: &yes, District: &district, Confidence: domain.Confidence{"is_rental_listing": .9}})
+	if err == nil {
+		t.Fatal("non-canonical district accepted")
+	}
+}
+
+func TestModelSpecificTimeout(t *testing.T) {
+	svc := New(config.LLMExtraction{Timeout: 20 * time.Second, ModelTimeouts: map[string]time.Duration{"strong": 45 * time.Second}}, nil, nil)
+	if got := svc.modelTimeout("light", 0, 3); got != 20*time.Second {
+		t.Fatalf("light=%s", got)
+	}
+	if got := svc.modelTimeout("strong", 1, 3); got != 45*time.Second {
+		t.Fatalf("strong=%s", got)
+	}
+	if got := svc.modelTimeout("final", 2, 3); got != 60*time.Second {
+		t.Fatalf("final=%s", got)
+	}
+}

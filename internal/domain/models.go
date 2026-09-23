@@ -117,6 +117,10 @@ type Listing struct {
 	ExtractionStatus         string
 	LLMExtractedAt           *time.Time
 	LLMModel                 string
+	ExtractionAttempts       int
+	NextExtractionRetryAt    *time.Time
+	LastExtractionError      string
+	RankedAt                 *time.Time
 }
 
 type SearchFilter struct {

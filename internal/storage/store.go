@@ -16,13 +16,23 @@ import (
 
 type Store struct{ DB *pgxpool.Pool }
 
-func Open(ctx context.Context, url string) (*Store, error) {
+func Open(ctx context.Context, url string, poolSize ...int) (*Store, error) {
 	cfg, err := pgxpool.ParseConfig(url)
 	if err != nil {
 		return nil, err
 	}
-	cfg.MaxConns = 20
-	cfg.MinConns = 2
+	maxConns, minConns := 5, 1
+	if len(poolSize) > 0 && poolSize[0] > 0 {
+		maxConns = poolSize[0]
+	}
+	if len(poolSize) > 1 && poolSize[1] >= 0 {
+		minConns = poolSize[1]
+	}
+	if minConns > maxConns {
+		minConns = maxConns
+	}
+	cfg.MaxConns = int32(maxConns)
+	cfg.MinConns = int32(minConns)
 	cfg.MaxConnLifetime = time.Hour
 	db, err := pgxpool.NewWithConfig(ctx, cfg)
 	if err != nil {
@@ -167,6 +177,10 @@ func (s *Store) InsertListing(ctx context.Context, p domain.FacebookPost, l doma
 	if err != nil {
 		return false, err
 	}
+	_, err = tx.Exec(ctx, `UPDATE listings SET ranked_at=now(),extraction_attempts=CASE WHEN extraction_status='success' THEN 0 ELSE extraction_attempts+1 END,next_extraction_retry_at=CASE WHEN extraction_status='success' THEN NULL ELSE now()+make_interval(secs=>LEAST(21600,30*power(2,LEAST(extraction_attempts,9)))::int) END,last_extraction_error=CASE WHEN extraction_status='success' THEN NULL ELSE last_extraction_error END WHERE post_id=$1`, postID)
+	if err != nil {
+		return false, err
+	}
 	if !isNew {
 		if _, err = tx.Exec(ctx, "DELETE FROM media WHERE post_id=$1", postID); err != nil {
 			return false, err
@@ -194,35 +208,39 @@ func (s *Store) Benchmarks(ctx context.Context, l domain.Listing) (ranking.Bench
 
 // RerankPeriod refreshes stored scores against current comparables before a
 // collection is selected. The bounded pool keeps this safe for interactive use.
-func (s *Store) RerankPeriod(ctx context.Context, after time.Time, engine ranking.Engine, limit int) (int, error) {
-	if limit < 1 || limit > 500 {
-		limit = 500
-	}
-	page, err := s.Search(ctx, 0, domain.SearchFilter{FreshAfter: &after, Sort: "new", Limit: limit})
-	if err != nil {
-		return 0, err
+func (s *Store) RerankPeriod(ctx context.Context, after time.Time, engine ranking.Engine, batch int) (int, error) {
+	if batch < 1 || batch > 500 {
+		batch = 250
 	}
 	updated := 0
-	for _, l := range page.Items {
-		b, e := s.Benchmarks(ctx, l)
-		if e != nil {
-			return updated, e
+	for offset := 0; ; offset += batch {
+		page, err := s.Search(ctx, 0, domain.SearchFilter{FreshAfter: &after, Sort: "new", Limit: batch, Offset: offset})
+		if err != nil {
+			return updated, err
 		}
-		score, confidence := engine.Score(l, b, time.Now())
-		if _, e = s.DB.Exec(ctx, "UPDATE listings SET deal_score=$2,score_confidence=$3,updated_at=now() WHERE id=$1", l.ID, score, confidence); e != nil {
-			return updated, e
+		for _, l := range page.Items {
+			b, e := s.Benchmarks(ctx, l)
+			if e != nil {
+				return updated, e
+			}
+			score, confidence := engine.Score(l, b, time.Now())
+			if e = s.UpdateScore(ctx, l.ID, score, confidence); e != nil {
+				return updated, e
+			}
+			updated++
 		}
-		updated++
+		if len(page.Items) < batch {
+			return updated, nil
+		}
 	}
-	return updated, nil
 }
 
-const listingSelect = `SELECT l.id,p.id,p.facebook_post_id,p.facebook_url,p.group_id,g.name,coalesce(p.author_name,''),p.original_text,p.published_at,l.created_at,l.rent_min,l.rent_max,l.foreigner_price,l.estimated_monthly_total_min,l.estimated_monthly_total_max,l.currency,l.is_rental,l.bedrooms,l.rooms,l.area_m2,coalesce(l.property_type,''),coalesce(l.district,''),coalesce(l.ward,''),coalesce(l.location_original,''),coalesce(l.street,''),coalesce(l.address,''),coalesce(l.building,''),l.near_beach,l.beach_distance_m,coalesce(l.furnished,''),l.amenities,l.pets_allowed,l.foreigners_accepted,l.temporary_residence,l.lease_months,l.deposit_amount,l.utilities,l.restrictions,l.raw_values,l.confidence,l.deal_score,l.score_confidence,coalesce((SELECT jsonb_agg(m.url ORDER BY m.position) FROM media m WHERE m.post_id=p.id),'[]'),coalesce(l.extraction_version,''),l.extraction_status,l.llm_extracted_at,coalesce(l.llm_model,'') FROM listings l JOIN posts p ON p.id=l.post_id JOIN fb_groups g ON g.id=p.group_id`
+const listingSelect = `SELECT l.id,p.id,p.facebook_post_id,p.facebook_url,p.group_id,g.name,coalesce(p.author_name,''),p.original_text,p.published_at,l.created_at,l.rent_min,l.rent_max,l.foreigner_price,l.estimated_monthly_total_min,l.estimated_monthly_total_max,l.currency,l.is_rental,l.bedrooms,l.rooms,l.area_m2,coalesce(l.property_type,''),coalesce(l.district,''),coalesce(l.ward,''),coalesce(l.location_original,''),coalesce(l.street,''),coalesce(l.address,''),coalesce(l.building,''),l.near_beach,l.beach_distance_m,coalesce(l.furnished,''),l.amenities,l.pets_allowed,l.foreigners_accepted,l.temporary_residence,l.lease_months,l.deposit_amount,l.utilities,l.restrictions,l.raw_values,l.confidence,l.deal_score,l.score_confidence,coalesce((SELECT jsonb_agg(m.url ORDER BY m.position) FROM media m WHERE m.post_id=p.id),'[]'),coalesce(l.extraction_version,''),l.extraction_status,l.llm_extracted_at,coalesce(l.llm_model,''),l.extraction_attempts,l.next_extraction_retry_at,coalesce(l.last_extraction_error,''),l.ranked_at FROM listings l JOIN posts p ON p.id=l.post_id JOIN fb_groups g ON g.id=p.group_id`
 
 func scanListing(row pgx.Row) (domain.Listing, error) {
 	var l domain.Listing
 	var amenities, utilities, restrictions, raw, confidence, media []byte
-	err := row.Scan(&l.ID, &l.PostID, &l.FacebookPostID, &l.FacebookURL, &l.GroupID, &l.GroupName, &l.AuthorName, &l.OriginalText, &l.PublishedAt, &l.CreatedAt, &l.RentMin, &l.RentMax, &l.ForeignerPrice, &l.EstimatedMonthlyTotalMin, &l.EstimatedMonthlyTotalMax, &l.Currency, &l.IsRental, &l.Bedrooms, &l.Rooms, &l.AreaM2, &l.PropertyType, &l.District, &l.Ward, &l.LocationOriginal, &l.Street, &l.Address, &l.Building, &l.NearBeach, &l.BeachDistanceM, &l.Furnished, &amenities, &l.PetsAllowed, &l.ForeignersAccepted, &l.TemporaryResidence, &l.LeaseMonths, &l.DepositAmount, &utilities, &restrictions, &raw, &confidence, &l.DealScore, &l.ScoreConfidence, &media, &l.ExtractionVersion, &l.ExtractionStatus, &l.LLMExtractedAt, &l.LLMModel)
+	err := row.Scan(&l.ID, &l.PostID, &l.FacebookPostID, &l.FacebookURL, &l.GroupID, &l.GroupName, &l.AuthorName, &l.OriginalText, &l.PublishedAt, &l.CreatedAt, &l.RentMin, &l.RentMax, &l.ForeignerPrice, &l.EstimatedMonthlyTotalMin, &l.EstimatedMonthlyTotalMax, &l.Currency, &l.IsRental, &l.Bedrooms, &l.Rooms, &l.AreaM2, &l.PropertyType, &l.District, &l.Ward, &l.LocationOriginal, &l.Street, &l.Address, &l.Building, &l.NearBeach, &l.BeachDistanceM, &l.Furnished, &amenities, &l.PetsAllowed, &l.ForeignersAccepted, &l.TemporaryResidence, &l.LeaseMonths, &l.DepositAmount, &utilities, &restrictions, &raw, &confidence, &l.DealScore, &l.ScoreConfidence, &media, &l.ExtractionVersion, &l.ExtractionStatus, &l.LLMExtractedAt, &l.LLMModel, &l.ExtractionAttempts, &l.NextExtractionRetryAt, &l.LastExtractionError, &l.RankedAt)
 	if err == nil {
 		_ = json.Unmarshal(amenities, &l.Amenities)
 		_ = json.Unmarshal(utilities, &l.Utilities)
@@ -257,13 +275,65 @@ func (s *Store) ExtractionBackfillBatch(ctx context.Context, version string, aft
 	return out, rows.Err()
 }
 
+func (s *Store) ExtractionRetryBatch(ctx context.Context, version string, limit int) ([]domain.Listing, error) {
+	if limit < 1 || limit > 200 {
+		limit = 20
+	}
+	rows, err := s.DB.Query(ctx, listingSelect+` WHERE (l.extraction_status IN ('pending','failed') OR l.extraction_version IS DISTINCT FROM $1) AND (l.next_extraction_retry_at IS NULL OR l.next_extraction_retry_at<=now()) ORDER BY coalesce(l.next_extraction_retry_at,'epoch'),l.id LIMIT $2`, version, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []domain.Listing
+	for rows.Next() {
+		l, e := scanListing(rows)
+		if e != nil {
+			return nil, e
+		}
+		out = append(out, l)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) StaleRankingBatch(ctx context.Context, staleBefore time.Time, limit int) ([]domain.Listing, error) {
+	if limit < 1 || limit > 500 {
+		limit = 100
+	}
+	rows, err := s.DB.Query(ctx, listingSelect+` WHERE l.is_rental IS DISTINCT FROM false AND l.rent_min IS NOT NULL AND (l.ranked_at IS NULL OR l.ranked_at<$1) ORDER BY l.ranked_at NULLS FIRST,l.id LIMIT $2`, staleBefore, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []domain.Listing
+	for rows.Next() {
+		l, e := scanListing(rows)
+		if e != nil {
+			return nil, e
+		}
+		out = append(out, l)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) UpdateScore(ctx context.Context, id int64, score, confidence float64) error {
+	_, err := s.DB.Exec(ctx, `UPDATE listings SET deal_score=$2,score_confidence=$3,ranked_at=now(),updated_at=now() WHERE id=$1`, id, score, confidence)
+	return err
+}
+
 func (s *Store) UpdateExtractedListing(ctx context.Context, l domain.Listing) error {
 	j := func(v any) []byte { b, _ := json.Marshal(v); return b }
-	_, err := s.DB.Exec(ctx, `UPDATE listings SET rent_min=$2,rent_max=$3,foreigner_price=$4,estimated_monthly_total_min=$5,estimated_monthly_total_max=$6,is_rental=$7,bedrooms=$8,rooms=$9,area_m2=$10,property_type=NULLIF($11,''),district=NULLIF($12,''),ward=NULLIF($13,''),location_original=NULLIF($14,''),street=NULLIF($15,''),address=NULLIF($16,''),building=NULLIF($17,''),near_beach=$18,beach_distance_m=$19,furnished=NULLIF($20,''),amenities=$21,pets_allowed=$22,foreigners_accepted=$23,lease_months=$24,deposit_amount=$25,utilities=$26,restrictions=$27,raw_values=$28,confidence=$29,deal_score=$30,score_confidence=$31,extraction_version=NULLIF($32,''),extraction_status=$33,llm_extracted_at=$34,llm_model=NULLIF($35,''),updated_at=now() WHERE id=$1`, l.ID, l.RentMin, l.RentMax, l.ForeignerPrice, l.EstimatedMonthlyTotalMin, l.EstimatedMonthlyTotalMax, l.IsRental, l.Bedrooms, l.Rooms, l.AreaM2, l.PropertyType, l.District, l.Ward, l.LocationOriginal, l.Street, l.Address, l.Building, l.NearBeach, l.BeachDistanceM, l.Furnished, j(l.Amenities), l.PetsAllowed, l.ForeignersAccepted, l.LeaseMonths, l.DepositAmount, j(l.Utilities), j(l.Restrictions), j(l.RawValues), j(l.Confidence), l.DealScore, l.ScoreConfidence, l.ExtractionVersion, l.ExtractionStatus, l.LLMExtractedAt, l.LLMModel)
+	_, err := s.DB.Exec(ctx, `UPDATE listings SET rent_min=$2,rent_max=$3,foreigner_price=$4,estimated_monthly_total_min=$5,estimated_monthly_total_max=$6,is_rental=$7,bedrooms=$8,rooms=$9,area_m2=$10,property_type=NULLIF($11,''),district=NULLIF($12,''),ward=NULLIF($13,''),location_original=NULLIF($14,''),street=NULLIF($15,''),address=NULLIF($16,''),building=NULLIF($17,''),near_beach=$18,beach_distance_m=$19,furnished=NULLIF($20,''),amenities=$21,pets_allowed=$22,foreigners_accepted=$23,lease_months=$24,deposit_amount=$25,utilities=$26,restrictions=$27,raw_values=$28,confidence=$29,deal_score=$30,score_confidence=$31,extraction_version=NULLIF($32,''),extraction_status=$33,llm_extracted_at=$34,llm_model=NULLIF($35,''),extraction_attempts=CASE WHEN $33='success' THEN 0 ELSE extraction_attempts+1 END,next_extraction_retry_at=CASE WHEN $33='success' THEN NULL ELSE now()+make_interval(secs=>LEAST(21600,30*power(2,LEAST(extraction_attempts,9)))::int) END,last_extraction_error=NULLIF($36,''),ranked_at=now(),updated_at=now() WHERE id=$1`, l.ID, l.RentMin, l.RentMax, l.ForeignerPrice, l.EstimatedMonthlyTotalMin, l.EstimatedMonthlyTotalMax, l.IsRental, l.Bedrooms, l.Rooms, l.AreaM2, l.PropertyType, l.District, l.Ward, l.LocationOriginal, l.Street, l.Address, l.Building, l.NearBeach, l.BeachDistanceM, l.Furnished, j(l.Amenities), l.PetsAllowed, l.ForeignersAccepted, l.LeaseMonths, l.DepositAmount, j(l.Utilities), j(l.Restrictions), j(l.RawValues), j(l.Confidence), l.DealScore, l.ScoreConfidence, l.ExtractionVersion, l.ExtractionStatus, l.LLMExtractedAt, l.LLMModel, l.LastExtractionError)
 	return err
 }
 
 func (s *Store) Search(ctx context.Context, userID int64, f domain.SearchFilter) (domain.SearchPage, error) {
+	if f.District != "" {
+		normalized := domain.NormalizeDistrict(f.District)
+		if normalized == "" {
+			normalized = domain.DistrictUnknown
+		}
+		f.District = normalized
+	}
 	args := []any{userID}
 	where := []string{"l.is_rental IS DISTINCT FROM false", "NOT EXISTS(SELECT 1 FROM hidden_listings h WHERE h.telegram_user_id=$1 AND h.listing_id=l.id)"}
 	add := func(cond string, v any) { args = append(args, v); where = append(where, fmt.Sprintf(cond, len(args))) }

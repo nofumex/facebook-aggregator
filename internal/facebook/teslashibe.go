@@ -2,9 +2,11 @@ package facebook
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
 	"net/url"
 	"regexp"
 	"strings"
@@ -22,19 +24,26 @@ type TeslaShibeConfig struct {
 	MaxRetries       int
 	DocIDs           map[string]string
 	ResponseObserver func([]byte)
+	DisableHTTP2     bool
 }
 
 func NewTeslaShibe(c TeslaShibeConfig) (*TeslaShibe, error) {
-	client, err := groups.New(c.Cookies,
-		groups.WithMinRequestGap(c.MinRequestGap),
-		groups.WithRetry(c.MaxRetries, time.Second),
-		groups.WithDocIDs(c.DocIDs),
-		groups.WithResponseObserver(c.ResponseObserver),
-	)
+	opts := []groups.Option{groups.WithMinRequestGap(c.MinRequestGap), groups.WithRetry(c.MaxRetries, time.Second), groups.WithDocIDs(c.DocIDs), groups.WithResponseObserver(c.ResponseObserver)}
+	if c.DisableHTTP2 {
+		opts = append(opts, groups.WithHTTPClient(facebookHTTP1Client()))
+	}
+	client, err := groups.New(c.Cookies, opts...)
 	if err != nil {
 		return nil, classify(err)
 	}
 	return &TeslaShibe{client: client}, nil
+}
+
+func facebookHTTP1Client() *http.Client {
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.ForceAttemptHTTP2 = false
+	transport.TLSNextProto = map[string]func(string, *tls.Conn) http.RoundTripper{}
+	return &http.Client{Transport: transport, Timeout: 30 * time.Second}
 }
 
 func (a *TeslaShibe) Name() string { return "teslashibe/facebook-go (adapted)" }

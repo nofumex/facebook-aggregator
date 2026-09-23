@@ -255,7 +255,7 @@ func (b *Bot) applyFilter(ctx context.Context, q *CallbackQuery, p []string) {
 			v, _ := strconv.Atoi(p[2])
 			f.Bedrooms = &v
 		case "district":
-			f.District = p[2]
+			f.District = domain.NormalizeDistrict(p[2])
 		case "type":
 			f.PropertyType = p[2]
 		case "area":
@@ -415,7 +415,11 @@ func card(l domain.Listing, vndToRUB float64) string {
 	}
 	if l.District != "" || l.Ward != "" || l.Address != "" {
 		locations := make([]string, 0, 3)
-		for _, value := range []string{l.District, l.Ward, l.Address} {
+		district := domain.DistrictLabel(l.District)
+		if district == "" {
+			district = l.District
+		}
+		for _, value := range []string{district, l.Ward, l.Address} {
 			if value != "" {
 				locations = append(locations, value)
 			}
@@ -585,7 +589,11 @@ func (b *Bot) showMarket(ctx context.Context, q *CallbackQuery) {
 	if len(m.Districts) > 0 {
 		text += "\n\n<b>По районам</b>"
 		for _, d := range m.Districts {
-			text += fmt.Sprintf("\n%s · %d объявл. · %s ₫", html.EscapeString(d.District), d.Listings, money(d.MedianRent))
+			label := domain.DistrictLabel(d.District)
+			if label == "" {
+				label = d.District
+			}
+			text += fmt.Sprintf("\n%s · %d объявл. · %s ₫", html.EscapeString(label), d.Listings, money(d.MedianRent))
 		}
 	}
 	if m.Listings30d < 20 {
@@ -621,7 +629,7 @@ func (b *Bot) runCollection(ctx context.Context, q *CallbackQuery, p []string) {
 }
 
 func (b *Bot) showAdmin(ctx context.Context, q *CallbackQuery) {
-	k := Markup{[][]Button{{cb("Facebook Groups", "agroups")}, {cb("LLM", "llm")}, {cb("← Меню", "menu")}}}
+	k := Markup{[][]Button{{cb("Facebook Groups", "agroups")}, {cb("LLM-куратор подборок", "llm")}, {cb("← Меню", "menu")}}}
 	b.editOrSend(ctx, q.Message.Chat.ID, q.Message.MessageID, "<b>🛠 Админка</b>\n\nFacebook adapter: <code>"+html.EscapeString(b.fb.Name())+"</code>", k)
 }
 func (b *Bot) showGroups(ctx context.Context, q *CallbackQuery) {
@@ -723,7 +731,7 @@ func (b *Bot) checkGroup(ctx context.Context, q *CallbackQuery, p []string) {
 func (b *Bot) showLLM(ctx context.Context, q *CallbackQuery) {
 	enabled := false
 	_ = b.store.Setting(ctx, "llm.enabled", &enabled)
-	text := fmt.Sprintf("<b>LLM</b>\nСтатус: %s\n\nПри включении LLM дополняет только плохо распарсенные объявления до расчёта рейтинга и затем выполняет финальный отбор подборки. При сбое продолжает работать rule-based pipeline.", map[bool]string{true: "включён", false: "выключен"}[enabled])
+	text := fmt.Sprintf("<b>LLM-куратор подборок</b>\nСтатус: %s\n\nЭто отдельный optional этап: он может исключить сомнительный вариант и написать причину, но не меняет normalized facts и deal_score.\n\nSemantic extraction настраивается через LLM_EXTRACTION_*: при включении она выполняется один раз для каждого нового/изменённого объявления. Rule parser остаётся fallback и check layer.", map[bool]string{true: "включён", false: "выключен"}[enabled])
 	k := Markup{[][]Button{{cb(map[bool]string{true: "Выключить", false: "Включить"}[enabled], "llmset:enabled")}, {cb("Provider", "llmset:provider"), cb("Base URL", "llmset:base_url")}, {cb("Model", "llmset:model"), cb("Timeout", "llmset:timeout")}, {cb("Concurrency", "llmset:concurrency"), cb("API key", "llmset:api_key")}, {cb("Проверить подключение", "llmcheck")}, {cb("← Админка", "admin")}}}
 	b.editOrSend(ctx, q.Message.Chat.ID, q.Message.MessageID, text, k)
 }
@@ -927,7 +935,11 @@ func filterSummary(f domain.SearchFilter) string {
 		}
 	}
 	if f.District != "" {
-		x = append(x, f.District)
+		label := domain.DistrictLabel(f.District)
+		if label == "" {
+			label = f.District
+		}
+		x = append(x, label)
 	}
 	if f.PropertyType != "" {
 		x = append(x, map[string]string{"apartment": "квартира", "house": "дом", "room": "комната"}[f.PropertyType])

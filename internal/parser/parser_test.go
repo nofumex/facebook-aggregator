@@ -73,6 +73,19 @@ func TestParseNaturalSearch(t *testing.T) {
 	}
 }
 
+func TestDistrictAliasesShareCanonicalEnum(t *testing.T) {
+	for _, q := range []string{"Sơn Trà", "son tra"} {
+		if got := ParseSearch(q).District; got != "Son Tra" {
+			t.Fatalf("%q -> %q", q, got)
+		}
+	}
+	for _, q := range []string{"Ngũ Hành Sơn", "My An", "Khu FPT"} {
+		if got := ParseSearch(q).District; got != "Ngu Hanh Son" {
+			t.Fatalf("%q -> %q", q, got)
+		}
+	}
+}
+
 func TestCleanForExtractionPreservesVisibleFacts(t *testing.T) {
 	in := "[🏠](https://static.xx.fbcdn.net/icon.png) Studio 4TR5 [📍](https://facebook.com/x) Khu FPT +84901234567"
 	want := "🏠 Studio 4TR5 📍 Khu FPT +84901234567"

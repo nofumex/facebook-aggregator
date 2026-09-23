@@ -15,6 +15,7 @@ services:
       retries: 10
   bot:
     build: .
+    image: facebook-aggregator
     restart: unless-stopped
     env_file: .env
     environment:

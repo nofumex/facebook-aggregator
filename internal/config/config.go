@@ -10,15 +10,22 @@ import (
 )
 
 type Config struct {
-	DatabaseURL       string
-	TelegramToken     string
-	AdminIDs          map[int64]bool
-	EncryptionKey     []byte
-	HTTPAddr          string
-	DefaultPoll       time.Duration
-	WorkerConcurrency int
-	Facebook          Facebook
-	Extraction        LLMExtraction
+	DatabaseURL             string
+	TelegramToken           string
+	AdminIDs                map[int64]bool
+	EncryptionKey           []byte
+	HTTPAddr                string
+	DefaultPoll             time.Duration
+	WorkerConcurrency       int
+	DBMaxConns              int
+	DBMinConns              int
+	BackfillConcurrency     int
+	ExtractionRetryInterval time.Duration
+	ExtractionRetryBatch    int
+	RerankInterval          time.Duration
+	RerankBatch             int
+	Facebook                Facebook
+	Extraction              LLMExtraction
 }
 
 type LLMExtraction struct {
@@ -29,12 +36,16 @@ type LLMExtraction struct {
 	Concurrency   int
 	SchemaVersion string
 	Models        []string
+	ModelTimeouts map[string]time.Duration
+	RetryBase     time.Duration
+	MaxAttempts   int
 }
 
 type Facebook struct {
 	SB, DATR, CUser, XS, FR, PSL, PSN string
 	MinRequestGap                     time.Duration
 	MaxRetries                        int
+	DisableHTTP2                      bool
 	DocIDs                            map[string]string
 }
 
@@ -43,13 +54,16 @@ func Load() (Config, error) {
 		DatabaseURL: os.Getenv("DATABASE_URL"), TelegramToken: os.Getenv("TELEGRAM_BOT_TOKEN"),
 		HTTPAddr: env("HTTP_ADDR", ":8080"), DefaultPoll: duration("DEFAULT_POLL_INTERVAL", 5*time.Minute),
 		WorkerConcurrency: integer("SYNC_CONCURRENCY", 3),
+		DBMaxConns:        integer("DB_MAX_CONNS", 5), DBMinConns: integer("DB_MIN_CONNS", 1), BackfillConcurrency: integer("BACKFILL_CONCURRENCY", 2),
+		ExtractionRetryInterval: duration("EXTRACTION_RETRY_INTERVAL", 5*time.Minute), ExtractionRetryBatch: integer("EXTRACTION_RETRY_BATCH", 20), RerankInterval: duration("RERANK_INTERVAL", 15*time.Minute), RerankBatch: integer("RERANK_BATCH", 100),
 		Extraction: LLMExtraction{
 			Enabled: boolEnv("LLM_EXTRACTION_ENABLED", false), BaseURL: strings.TrimRight(os.Getenv("LLM_EXTRACTION_BASE_URL"), "/"), APIKey: os.Getenv("LLM_EXTRACTION_API_KEY"),
 			Timeout: duration("LLM_EXTRACTION_TIMEOUT", 25*time.Second), Concurrency: integer("LLM_EXTRACTION_CONCURRENCY", 2), SchemaVersion: env("LLM_EXTRACTION_SCHEMA_VERSION", "rental-v1"),
-			Models: csv(env("LLM_EXTRACTION_MODELS", "llama-3.2-1b-instruct,ministral-3b,llama-3.2-3b,ministral-3-8b,gpt-oss-20b,gemma-sea-lion-v4-27b,gemini-3.5-flash-lite")),
+			Models:        csv(env("LLM_EXTRACTION_MODELS", "ministral-3-8b,gpt-oss-20b,gemma-sea-lion-v4-27b,gemini-3.5-flash-lite")),
+			ModelTimeouts: durationMap(os.Getenv("LLM_EXTRACTION_MODEL_TIMEOUTS")), RetryBase: duration("LLM_EXTRACTION_RETRY_BASE", 500*time.Millisecond), MaxAttempts: integer("LLM_EXTRACTION_MAX_ATTEMPTS", 4),
 		},
-		Facebook:          Facebook{SB: envAny("FB_SB", "FACEBOOK_SB"), DATR: envAny("FB_DATR", "FACEBOOK_DATR"), CUser: envAny("FB_CUSER", "FACEBOOK_C_USER"), XS: envAny("FB_XS", "FACEBOOK_XS"), FR: envAny("FB_FR", "FACEBOOK_FR"), PSL: envAny("FB_PSL", "FACEBOOK_PS_L"), PSN: envAny("FB_PSN", "FACEBOOK_PS_N"), MinRequestGap: duration("FB_MIN_REQUEST_GAP", 1200*time.Millisecond), MaxRetries: integer("FB_MAX_RETRIES", 4), DocIDs: parseMap(os.Getenv("FB_DOC_IDS"))},
-		AdminIDs:          map[int64]bool{},
+		Facebook: Facebook{SB: envAny("FB_SB", "FACEBOOK_SB"), DATR: envAny("FB_DATR", "FACEBOOK_DATR"), CUser: envAny("FB_CUSER", "FACEBOOK_C_USER"), XS: envAny("FB_XS", "FACEBOOK_XS"), FR: envAny("FB_FR", "FACEBOOK_FR"), PSL: envAny("FB_PSL", "FACEBOOK_PS_L"), PSN: envAny("FB_PSN", "FACEBOOK_PS_N"), MinRequestGap: duration("FB_MIN_REQUEST_GAP", 1200*time.Millisecond), MaxRetries: integer("FB_MAX_RETRIES", 4), DisableHTTP2: boolEnv("FB_DISABLE_HTTP2", false), DocIDs: parseMap(os.Getenv("FB_DOC_IDS"))},
+		AdminIDs: map[int64]bool{},
 	}
 	for _, raw := range strings.Split(os.Getenv("TELEGRAM_ADMIN_IDS"), ",") {
 		if id, err := strconv.ParseInt(strings.TrimSpace(raw), 10, 64); err == nil {
@@ -67,6 +81,19 @@ func Load() (Config, error) {
 		return c, errors.New("DATABASE_URL is required")
 	}
 	return c, nil
+}
+
+func durationMap(s string) map[string]time.Duration {
+	m := map[string]time.Duration{}
+	for _, pair := range strings.Split(s, ",") {
+		p := strings.SplitN(strings.TrimSpace(pair), "=", 2)
+		if len(p) == 2 {
+			if d, e := time.ParseDuration(strings.TrimSpace(p[1])); e == nil && d > 0 {
+				m[strings.TrimSpace(p[0])] = d
+			}
+		}
+	}
+	return m
 }
 
 func boolEnv(k string, d bool) bool {

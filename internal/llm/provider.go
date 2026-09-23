@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"strings"
 	"time"
@@ -46,6 +48,27 @@ type CallMeta struct {
 	Latency                   time.Duration
 	InputTokens, OutputTokens int
 }
+type HTTPError struct {
+	Status int
+	Body   string
+}
+
+func (e *HTTPError) Error() string { return fmt.Sprintf("LLM HTTP %d: %s", e.Status, e.Body) }
+func IsTransient(err error) bool {
+	if err == nil || errors.Is(err, context.Canceled) {
+		return false
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	var h *HTTPError
+	if errors.As(err, &h) {
+		return h.Status == http.StatusRequestTimeout || h.Status == http.StatusTooManyRequests || h.Status >= 500
+	}
+	var n net.Error
+	return errors.As(err, &n)
+}
+
 type OpenAICompatible struct {
 	cfg    Config
 	client *http.Client
@@ -215,8 +238,8 @@ func (p *OpenAICompatible) EnrichDetailed(ctx context.Context, originalText stri
 	schema := enrichmentSchema()
 	responseFormat := map[string]any{"type": "json_schema", "json_schema": map[string]any{"name": "rental_enrichment", "strict": true, "schema": schema}}
 	if p.cfg.Provider != "openai" {
-		// Some compatible endpoints implement JSON mode but not OpenAI's
-		// json_schema extension. Exact-shape validation below remains strict.
+		// Compatible endpoints often expose JSON mode without json_schema.
+		// Missing nullable fields are canonicalized locally before validation.
 		responseFormat = map[string]any{"type": "json_object"}
 	}
 	body := map[string]any{
@@ -237,11 +260,12 @@ func (p *OpenAICompatible) EnrichDetailed(ctx context.Context, originalText stri
 	if err != nil {
 		return domain.Enrichment{}, meta, err
 	}
-	if err = validateEnrichmentShape([]byte(content)); err != nil {
+	normalized, err := normalizeEnrichmentJSON([]byte(content), p.cfg.Provider != "openai")
+	if err != nil {
 		return domain.Enrichment{}, meta, err
 	}
 	var out domain.Enrichment
-	decoder := json.NewDecoder(strings.NewReader(content))
+	decoder := json.NewDecoder(bytes.NewReader(normalized))
 	decoder.DisallowUnknownFields()
 	if err = decoder.Decode(&out); err != nil {
 		return domain.Enrichment{}, meta, fmt.Errorf("invalid enrichment JSON: %w", err)
@@ -297,21 +321,91 @@ func (p *OpenAICompatible) AvailableModels(ctx context.Context) ([]string, error
 	return ids, nil
 }
 
-func validateEnrichmentShape(raw []byte) error {
-	required := enrichmentKeys()
+func normalizeEnrichmentJSON(raw []byte, allowMissingNullable bool) ([]byte, error) {
+	keys := enrichmentKeys()
+	allowed := map[string]bool{}
+	for _, key := range keys {
+		allowed[key] = true
+	}
 	var object map[string]json.RawMessage
 	if err := json.Unmarshal(raw, &object); err != nil {
-		return fmt.Errorf("invalid enrichment JSON: %w", err)
+		return nil, fmt.Errorf("invalid enrichment JSON: %w", err)
 	}
-	if len(object) != len(required) {
-		return fmt.Errorf("invalid enrichment JSON: expected %d fields, got %d", len(required), len(object))
-	}
-	for _, key := range required {
-		if _, ok := object[key]; !ok {
-			return fmt.Errorf("invalid enrichment JSON: missing %s", key)
+	for key := range object {
+		if !allowed[key] {
+			return nil, fmt.Errorf("invalid enrichment JSON: unknown field %s", key)
 		}
 	}
-	return nil
+	if _, ok := object["is_rental_listing"]; !ok {
+		return nil, fmt.Errorf("invalid enrichment JSON: missing is_rental_listing")
+	}
+	if !allowMissingNullable {
+		for _, key := range keys {
+			if _, ok := object[key]; !ok {
+				return nil, fmt.Errorf("invalid enrichment JSON: missing %s", key)
+			}
+		}
+	}
+	for _, key := range keys {
+		if _, ok := object[key]; !ok {
+			object[key] = json.RawMessage("null")
+		}
+	}
+	if string(object["district"]) == "null" {
+		object["district"] = json.RawMessage(`"Unknown"`)
+	}
+	var err error
+	object["utilities"], err = normalizeNullableObject(object["utilities"], []string{"electricity_vnd_per_kwh", "water_vnd_per_person", "water_vnd_per_month", "wifi_vnd_per_month", "service_vnd_per_month", "parking_vnd_per_month"}, false)
+	if err != nil {
+		return nil, fmt.Errorf("invalid utilities: %w", err)
+	}
+	object["amenities"], err = normalizeNullableObject(object["amenities"], []string{"balcony", "private_washing_machine", "washing_machine", "elevator", "air_conditioning", "kitchen", "pool", "gym", "parking"}, false)
+	if err != nil {
+		return nil, fmt.Errorf("invalid amenities: %w", err)
+	}
+	object["restrictions"], err = normalizeNullableObject(object["restrictions"], []string{"electric_bike_allowed"}, false)
+	if err != nil {
+		return nil, fmt.Errorf("invalid restrictions: %w", err)
+	}
+	object["confidence"], err = normalizeNullableObject(object["confidence"], confidenceKeys(), true)
+	if err != nil {
+		return nil, fmt.Errorf("invalid confidence: %w", err)
+	}
+	return json.Marshal(object)
+}
+
+func normalizeNullableObject(raw json.RawMessage, keys []string, zero bool) (json.RawMessage, error) {
+	if len(raw) == 0 || string(raw) == "null" {
+		raw = json.RawMessage(`{}`)
+	}
+	var object map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &object); err != nil {
+		return nil, err
+	}
+	allowed := map[string]bool{}
+	for _, key := range keys {
+		allowed[key] = true
+	}
+	for key := range object {
+		if !allowed[key] {
+			return nil, fmt.Errorf("unknown field %s", key)
+		}
+	}
+	for _, key := range keys {
+		if _, ok := object[key]; !ok {
+			if zero {
+				object[key] = json.RawMessage("0")
+			} else {
+				object[key] = json.RawMessage("null")
+			}
+		}
+	}
+	return json.Marshal(object)
+}
+
+func validateEnrichmentShape(raw []byte) error {
+	_, err := normalizeEnrichmentJSON(raw, false)
+	return err
 }
 
 type usage struct{ Input, Output int }
@@ -334,7 +428,7 @@ func (p *OpenAICompatible) chat(ctx context.Context, body map[string]any) (strin
 		return "", usage{}, err
 	}
 	if resp.StatusCode/100 != 2 {
-		return "", usage{}, fmt.Errorf("LLM HTTP %d: %s", resp.StatusCode, sanitize(string(raw)))
+		return "", usage{}, &HTTPError{Status: resp.StatusCode, Body: sanitize(string(raw))}
 	}
 	var envelope struct {
 		Choices []struct {
@@ -366,7 +460,7 @@ func enrichmentSchema() map[string]any {
 		"is_rental_listing": map[string]any{"type": "boolean"}, "rent_vnd": nullable("integer"), "rent_max_vnd": nullable("integer"),
 		"bedrooms": nullable("integer"), "property_type": map[string]any{"type": []string{"string", "null"}, "enum": []any{"apartment", "house", "room", "studio", nil}},
 		"rooms": nullable("integer"), "area_m2": nullable("number"),
-		"district":          map[string]any{"type": "string", "enum": []string{"Son Tra", "Ngu Hanh Son", "Hai Chau", "Thanh Khe", "Lien Chieu", "Cam Le", "Hoa Vang", "Other", "Unknown"}},
+		"district":          map[string]any{"type": "string", "enum": domain.CanonicalDistricts},
 		"location_original": nullable("string"), "ward": nullable("string"), "street": nullable("string"), "address": nullable("string"), "building": nullable("string"),
 		"furnished":  map[string]any{"type": []string{"string", "null"}, "enum": []any{"full", "partial", "none", nil}},
 		"near_beach": nullable("boolean"), "beach_distance_m": nullable("integer"), "deposit_vnd": nullable("integer"),
@@ -388,12 +482,15 @@ func enrichmentKeys() []string {
 }
 
 func confidenceSchema() map[string]any {
-	keys := []string{"is_rental_listing", "property_type", "bedrooms", "rooms", "area_m2", "rent_vnd", "rent_max_vnd", "deposit_vnd", "district", "location_original", "ward", "street", "address", "building", "furnished", "near_beach", "beach_distance_m", "foreigners_allowed", "foreigner_surcharge_vnd", "pets_allowed", "lease_months_min", "utilities", "amenities", "restrictions"}
+	keys := confidenceKeys()
 	properties := map[string]any{}
 	for _, key := range keys {
 		properties[key] = map[string]any{"type": []string{"number", "null"}, "minimum": 0, "maximum": 1}
 	}
 	return map[string]any{"type": "object", "properties": properties, "required": keys, "additionalProperties": false}
+}
+func confidenceKeys() []string {
+	return []string{"is_rental_listing", "property_type", "bedrooms", "rooms", "area_m2", "rent_vnd", "rent_max_vnd", "deposit_vnd", "district", "location_original", "ward", "street", "address", "building", "furnished", "near_beach", "beach_distance_m", "foreigners_allowed", "foreigner_surcharge_vnd", "pets_allowed", "lease_months_min", "utilities", "amenities", "restrictions"}
 }
 
 func truncateRunes(s string, n int) string {

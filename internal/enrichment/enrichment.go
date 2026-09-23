@@ -34,12 +34,12 @@ type Cache interface {
 // Service performs semantic extraction once per cleaned content hash and schema version.
 // It is intentionally separate from the optional final collection curator.
 type Service struct {
-	cfg          config.LLMExtraction
-	cache        Cache
-	log          *slog.Logger
-	mu           sync.Mutex
-	models       []string
-	sem          chan struct{}
+	cfg    config.LLMExtraction
+	cache  Cache
+	log    *slog.Logger
+	mu     sync.Mutex
+	models []string
+	sem    chan struct{}
 }
 
 func New(cfg config.LLMExtraction, cache Cache, log *slog.Logger) *Service {
@@ -91,14 +91,18 @@ func (s *Service) Apply(ctx context.Context, l domain.Listing) (domain.Listing, 
 		return failed(l, s.cfg.SchemaVersion), false, ctx.Err()
 	}
 	var last error
-	for attempt, model := range models {
-		p := llm.New(llm.Config{Provider: "compatible", BaseURL: s.cfg.BaseURL, APIKey: s.cfg.APIKey, Model: model, Timeout: s.cfg.Timeout, Concurrency: s.cfg.Concurrency, MaxTokens: 1400})
-		for retry := 0; retry < 2; retry++ {
+	for modelIndex, model := range models {
+		p := llm.New(llm.Config{Provider: "compatible", BaseURL: s.cfg.BaseURL, APIKey: s.cfg.APIKey, Model: model, Timeout: s.modelTimeout(model, modelIndex, len(models)), Concurrency: s.cfg.Concurrency, MaxTokens: 1400})
+		attempts := s.cfg.MaxAttempts
+		if attempts < 1 {
+			attempts = 4
+		}
+		for retry := 0; retry < attempts; retry++ {
 			result, meta, err := p.EnrichDetailed(ctx, clean, l)
 			if err == nil {
 				err = ValidateAgainst(result, l)
 			}
-			s.log.Info("LLM extraction attempt", "facebook_post_id", l.FacebookPostID, "model", model, "attempt", attempt+1, "retry", retry, "latency_ms", meta.Latency.Milliseconds(), "valid", err == nil, "fallback_reason", errorText(err), "input_tokens", meta.InputTokens, "output_tokens", meta.OutputTokens)
+			s.log.Info("LLM extraction attempt", "facebook_post_id", l.FacebookPostID, "model", model, "model_index", modelIndex+1, "attempt", retry+1, "latency_ms", meta.Latency.Milliseconds(), "valid", err == nil, "fallback_reason", errorText(err), "input_tokens", meta.InputTokens, "output_tokens", meta.OutputTokens)
 			if err == nil {
 				entry := CacheEntry{Result: result, Model: model, LatencyMS: int(meta.Latency.Milliseconds()), InputTokens: meta.InputTokens, OutputTokens: meta.OutputTokens}
 				if s.cache != nil {
@@ -114,22 +118,52 @@ func (s *Service) Apply(ctx context.Context, l domain.Listing) (domain.Listing, 
 			if ctx.Err() != nil {
 				return failed(l, s.cfg.SchemaVersion), false, ctx.Err()
 			}
-			if retry == 0 {
-				select {
-				case <-time.After(150 * time.Millisecond):
-				case <-ctx.Done():
-					return failed(l, s.cfg.SchemaVersion), false, ctx.Err()
-				}
+			if !llm.IsTransient(err) || retry+1 >= attempts {
+				break
+			}
+			base := s.cfg.RetryBase
+			if base <= 0 {
+				base = 500 * time.Millisecond
+			}
+			wait := base * time.Duration(1<<retry)
+			timer := time.NewTimer(wait)
+			select {
+			case <-timer.C:
+			case <-ctx.Done():
+				timer.Stop()
+				return failed(l, s.cfg.SchemaVersion), false, ctx.Err()
 			}
 		}
 	}
 	return failed(l, s.cfg.SchemaVersion), false, last
 }
 
-func (s *Service) activeModels(ctx context.Context) ([]string,error){
-	s.mu.Lock();defer s.mu.Unlock()
-	if len(s.models)>0{return append([]string(nil),s.models...),nil}
-	models,err:=s.discover(ctx);if err!=nil{return nil,err};s.models=models;return append([]string(nil),models...),nil
+func (s *Service) modelTimeout(model string, index, total int) time.Duration {
+	if d := s.cfg.ModelTimeouts[model]; d > 0 {
+		return d
+	}
+	base := s.cfg.Timeout
+	if base <= 0 {
+		base = 25 * time.Second
+	}
+	if index >= total-2 && base < 60*time.Second {
+		return 60 * time.Second
+	}
+	return base
+}
+
+func (s *Service) activeModels(ctx context.Context) ([]string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.models) > 0 {
+		return append([]string(nil), s.models...), nil
+	}
+	models, err := s.discover(ctx)
+	if err != nil {
+		return nil, err
+	}
+	s.models = models
+	return append([]string(nil), models...), nil
 }
 
 func (s *Service) discover(ctx context.Context) ([]string, error) {
@@ -166,8 +200,6 @@ func errorText(err error) string {
 	return err.Error()
 }
 
-var districts = map[string]bool{"Son Tra": true, "Ngu Hanh Son": true, "Hai Chau": true, "Thanh Khe": true, "Lien Chieu": true, "Cam Le": true, "Hoa Vang": true, "Other": true, "Unknown": true}
-
 func Validate(e domain.Enrichment) error { return ValidateAgainst(e, domain.Listing{}) }
 func ValidateAgainst(e domain.Enrichment, rules domain.Listing) error {
 	if e.IsRental == nil {
@@ -191,21 +223,46 @@ func ValidateAgainst(e domain.Enrichment, rules domain.Listing) error {
 	if e.AreaM2 != nil && (*e.AreaM2 < 8 || *e.AreaM2 > 1000) {
 		return fmt.Errorf("invalid area_m2")
 	}
-	if e.District == nil || !districts[*e.District] {
+	if e.District == nil || !domain.IsCanonicalDistrict(*e.District) {
 		return fmt.Errorf("invalid district")
 	}
 	if e.Furnished != nil && *e.Furnished != "full" && *e.Furnished != "partial" && *e.Furnished != "none" {
 		return fmt.Errorf("invalid furnished")
+	}
+	for key, value := range e.Utilities {
+		if value == nil {
+			continue
+		}
+		n, ok := value.(float64)
+		if !ok || n < 0 || n > 200_000_000 {
+			return fmt.Errorf("invalid utility %s", key)
+		}
+	}
+	for key, value := range e.Amenities {
+		if value == nil {
+			continue
+		}
+		if _, ok := value.(bool); !ok {
+			return fmt.Errorf("invalid amenity %s", key)
+		}
+	}
+	for key, value := range e.Restrictions {
+		if value == nil {
+			continue
+		}
+		if _, ok := value.(bool); !ok {
+			return fmt.Errorf("invalid restriction %s", key)
+		}
 	}
 	for k, c := range e.Confidence {
 		if math.IsNaN(c) || c < 0 || c > 1 {
 			return fmt.Errorf("invalid confidence for %s", k)
 		}
 	}
-	if e.Confidence["is_rental_listing"] < minimumLLMConfidence {
+	if c := e.Confidence["is_rental_listing"]; c > 0 && c < minimumLLMConfidence {
 		return fmt.Errorf("low confidence for is_rental_listing")
 	}
-	if e.RentMinVND != nil && e.Confidence["rent_vnd"] < minimumLLMConfidence {
+	if c := e.Confidence["rent_vnd"]; e.RentMinVND != nil && c > 0 && c < minimumLLMConfidence {
 		return fmt.Errorf("low confidence for rent_vnd")
 	}
 	if rules.RentMin != nil && rules.Confidence["price"] >= .85 && e.RentMinVND == nil {
@@ -213,7 +270,9 @@ func ValidateAgainst(e domain.Enrichment, rules domain.Listing) error {
 	}
 	if rules.RentMin != nil && e.RentMinVND != nil && rules.Confidence["price"] >= .85 && rules.RawValues["possible_old_and_new_prices"] == nil {
 		ratio := float64(*e.RentMinVND) / float64(*rules.RentMin)
-		if ratio < .85 || ratio > 1.15 { return fmt.Errorf("rent contradicts high-confidence rule evidence") }
+		if ratio < .85 || ratio > 1.15 {
+			return fmt.Errorf("rent contradicts high-confidence rule evidence")
+		}
 	}
 	if rules.Bedrooms != nil && e.Bedrooms != nil && rules.Confidence["bedrooms"] >= .85 && *rules.Bedrooms != *e.Bedrooms {
 		return fmt.Errorf("bedrooms contradict high-confidence rule evidence")
@@ -240,16 +299,17 @@ func Merge(l domain.Listing, e domain.Enrichment) domain.Listing {
 		l.Restrictions = map[string]any{}
 	}
 	l.RawValues["extraction_sources"] = map[string]any{"rules": l.Confidence, "llm": e.Confidence}
-	if e.IsRental != nil && trusted(e, "is_rental_listing") {
+	l.RawValues["llm_enriched"] = true
+	if e.IsRental != nil && (l.IsRental == nil || trusted(e, "is_rental_listing")) {
 		l.IsRental = e.IsRental
 		l.Confidence["is_rental"] = e.Confidence["is_rental_listing"]
 	}
 	ambiguous := l.RawValues["possible_old_and_new_prices"] != nil
-	if e.RentMinVND != nil && trusted(e, "rent_vnd") && (ambiguous || l.RentMin == nil || l.Confidence["price"] < trustedRuleConfidence) {
+	if e.RentMinVND != nil && (l.RentMin == nil || trusted(e, "rent_vnd") && (ambiguous || l.Confidence["price"] < trustedRuleConfidence)) {
 		l.RentMin = e.RentMinVND
 		l.Confidence["price"] = e.Confidence["rent_vnd"]
 	}
-	if e.RentMaxVND != nil && trusted(e, "rent_max_vnd") && (ambiguous || l.RentMax == nil || l.Confidence["price"] < trustedRuleConfidence) {
+	if e.RentMaxVND != nil && (l.RentMax == nil || trusted(e, "rent_max_vnd") && (ambiguous || l.Confidence["price"] < trustedRuleConfidence)) {
 		l.RentMax = e.RentMaxVND
 	}
 	if l.RentMin != nil && l.RentMax == nil {
@@ -260,6 +320,10 @@ func Merge(l domain.Listing, e domain.Enrichment) domain.Listing {
 	mergePtr(&l.Rooms, e.Rooms, l.Confidence, "rooms", e)
 	mergePtr(&l.AreaM2, e.AreaM2, l.Confidence, "area_m2", e)
 	mergeString(&l.PropertyType, e.PropertyType, l.Confidence, "property_type", e)
+	if l.District == "" && e.District != nil && *e.District == domain.DistrictUnknown {
+		l.District = domain.DistrictUnknown
+		l.Confidence["district"] = 0
+	}
 	mergeString(&l.District, e.District, l.Confidence, "district", e)
 	mergeString(&l.LocationOriginal, e.LocationOriginal, l.Confidence, "location_original", e)
 	mergeString(&l.Ward, e.Ward, l.Confidence, "ward", e)
@@ -274,13 +338,13 @@ func Merge(l domain.Listing, e domain.Enrichment) domain.Listing {
 	mergePtr(&l.ForeignerPrice, e.ForeignerSurcharge, l.Confidence, "foreigner_surcharge_vnd", e)
 	mergePtr(&l.PetsAllowed, e.PetsAllowed, l.Confidence, "pets_allowed", e)
 	mergePtr(&l.LeaseMonths, e.LeaseMonths, l.Confidence, "lease_months_min", e)
-	if trusted(e, "utilities") {
+	if usable(e, "utilities") {
 		copyAny(l.Utilities, e.Utilities)
 	}
-	if trusted(e, "restrictions") {
+	if usable(e, "restrictions") {
 		copyAny(l.Restrictions, e.Restrictions)
 	}
-	if trusted(e, "amenities") {
+	if usable(e, "amenities") {
 		for k, v := range e.Amenities {
 			if b, ok := v.(bool); ok {
 				l.Amenities[k] = b
@@ -291,14 +355,15 @@ func Merge(l domain.Listing, e domain.Enrichment) domain.Listing {
 	return l
 }
 func trusted(e domain.Enrichment, k string) bool { return e.Confidence[k] >= minimumLLMConfidence }
+func usable(e domain.Enrichment, k string) bool  { return e.Confidence[k] == 0 || trusted(e, k) }
 func mergePtr[T any](dst **T, src *T, c domain.Confidence, k string, e domain.Enrichment) {
-	if src != nil && trusted(e, k) && (*dst == nil || c[k] < trustedRuleConfidence) {
+	if src != nil && (*dst == nil || trusted(e, k) && c[k] < trustedRuleConfidence) {
 		*dst = src
 		c[k] = e.Confidence[k]
 	}
 }
 func mergeString(dst *string, src *string, c domain.Confidence, k string, e domain.Enrichment) {
-	if src != nil && strings.TrimSpace(*src) != "" && trusted(e, k) && (*dst == "" || c[k] < trustedRuleConfidence) {
+	if src != nil && strings.TrimSpace(*src) != "" && (*dst == "" || trusted(e, k) && c[k] < trustedRuleConfidence) {
 		*dst = strings.TrimSpace(*src)
 		c[k] = e.Confidence[k]
 	}

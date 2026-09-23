@@ -38,3 +38,30 @@ func TestEnrichMixedVietnameseEnglishRussianPost(t *testing.T) {
 		}
 	}
 }
+
+func TestCompatiblePartialObjectNormalizesCanonicalSchema(t *testing.T) {
+	content := `{"is_rental_listing":true,"property_type":"studio","bedrooms":0,"rent_vnd":4500000,"furnished":"full","utilities":{"electricity_vnd_per_kwh":4000},"amenities":{"washing_machine":true},"confidence":{"rent_vnd":0.9}}`
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"choices": []any{map[string]any{"message": map[string]any{"content": content}}}})
+	}))
+	defer srv.Close()
+	got, err := New(Config{Provider: "compatible", BaseURL: srv.URL, APIKey: "x", Model: "m"}).Enrich(context.Background(), "STUDIO KHU FPT 4TR5", domain.Listing{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.District == nil || *got.District != "Unknown" || got.AreaM2 != nil || got.Utilities["water_vnd_per_person"] != nil || got.Amenities["balcony"] != nil || got.Restrictions["electric_bike_allowed"] != nil || got.Confidence["area_m2"] != 0 {
+		t.Fatalf("not canonical: %+v", got)
+	}
+}
+
+func TestCompatibleRejectsImpossibleType(t *testing.T) {
+	content := `{"is_rental_listing":true,"bedrooms":"two"}`
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"choices": []any{map[string]any{"message": map[string]any{"content": content}}}})
+	}))
+	defer srv.Close()
+	_, err := New(Config{Provider: "compatible", BaseURL: srv.URL, APIKey: "x", Model: "m"}).Enrich(context.Background(), "x", domain.Listing{})
+	if err == nil {
+		t.Fatal("invalid type accepted")
+	}
+}

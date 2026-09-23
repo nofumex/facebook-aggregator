@@ -15,6 +15,7 @@ import (
 	"github.com/egori/facebook-aggregator/internal/storage"
 	"github.com/egori/facebook-aggregator/internal/syncer"
 	tg "github.com/egori/facebook-aggregator/internal/telegram"
+	"github.com/egori/facebook-aggregator/internal/workers"
 	"github.com/egori/facebook-aggregator/migrations"
 	"github.com/joho/godotenv"
 	"github.com/teslashibe/facebook-go/groups"
@@ -38,7 +39,7 @@ func main() {
 	log := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	store, e := storage.Open(ctx, cfg.DatabaseURL)
+	store, e := storage.Open(ctx, cfg.DatabaseURL, cfg.DBMaxConns, cfg.DBMinConns)
 	if e != nil {
 		fatal(e)
 	}
@@ -47,7 +48,7 @@ func main() {
 		fatal(e)
 	}
 	var adapter fb.Adapter
-	client, e := fb.NewTeslaShibe(fb.TeslaShibeConfig{Cookies: groups.Cookies{SB: cfg.Facebook.SB, DATR: cfg.Facebook.DATR, CUser: cfg.Facebook.CUser, XS: cfg.Facebook.XS, FR: cfg.Facebook.FR, PSL: cfg.Facebook.PSL, PSN: cfg.Facebook.PSN}, MinRequestGap: cfg.Facebook.MinRequestGap, MaxRetries: cfg.Facebook.MaxRetries, DocIDs: cfg.Facebook.DocIDs})
+	client, e := fb.NewTeslaShibe(fb.TeslaShibeConfig{Cookies: groups.Cookies{SB: cfg.Facebook.SB, DATR: cfg.Facebook.DATR, CUser: cfg.Facebook.CUser, XS: cfg.Facebook.XS, FR: cfg.Facebook.FR, PSL: cfg.Facebook.PSL, PSN: cfg.Facebook.PSN}, MinRequestGap: cfg.Facebook.MinRequestGap, MaxRetries: cfg.Facebook.MaxRetries, DisableHTTP2: cfg.Facebook.DisableHTTP2, DocIDs: cfg.Facebook.DocIDs})
 	if e != nil {
 		log.Error("facebook adapter unavailable", "error", e)
 		adapter = fb.UnavailableAdapter{Reason: e}
@@ -88,6 +89,8 @@ func main() {
 		}
 	}()
 	go syncService.Run(ctx)
+	go workers.RunExtractionRetry(ctx, store, extractor, rankEngine, cfg, log)
+	go workers.RunReranking(ctx, store, rankEngine, cfg, log)
 	go func() {
 		if err := bot.Run(ctx); err != nil {
 			log.Error("telegram bot stopped", "error", err)

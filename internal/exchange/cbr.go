@@ -25,12 +25,15 @@ type Provider interface {
 // the last successfully loaded rate remains usable instead of making cards
 // lose their rouble equivalent during a transient outage.
 type CBR struct {
-	client *http.Client
-	url    string
-	ttl    time.Duration
-	mu     sync.Mutex
-	rate   float64
-	until  time.Time
+	client     *http.Client
+	url        string
+	ttl        time.Duration
+	mu         sync.Mutex
+	rate       float64
+	until      time.Time
+	errorUntil time.Time
+	lastErr    error
+	refreshing bool
 }
 
 func NewCBR() *CBR {
@@ -39,25 +42,54 @@ func NewCBR() *CBR {
 
 func (c *CBR) VNDToRUB(ctx context.Context) (float64, error) {
 	c.mu.Lock()
-	if c.rate > 0 && time.Now().Before(c.until) {
+	now := time.Now()
+	if c.rate > 0 && now.Before(c.until) {
+		rate := c.rate
+		c.mu.Unlock()
+		return rate, nil
+	}
+	if now.Before(c.errorUntil) {
 		rate := c.rate
 		c.mu.Unlock()
 		return rate, nil
 	}
 	stale := c.rate
-	c.mu.Unlock()
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.url, nil)
-	if err != nil {
-		return staleOrError(stale, err)
+	if c.refreshing {
+		c.mu.Unlock()
+		return stale, nil
 	}
-	resp, err := c.client.Do(req)
+	c.refreshing = true
+	c.mu.Unlock()
+	defer func() { c.mu.Lock(); c.refreshing = false; c.mu.Unlock() }()
+
+	var resp *http.Response
+	var err error
+	for attempt := 0; attempt < 2; attempt++ {
+		req, e := http.NewRequestWithContext(ctx, http.MethodGet, c.url, nil)
+		if e != nil {
+			return c.fail(stale, e)
+		}
+		resp, err = c.client.Do(req)
+		if err == nil && (resp.StatusCode < 500 || resp.StatusCode >= 600) {
+			break
+		}
+		if resp != nil {
+			resp.Body.Close()
+		}
+		if attempt == 0 {
+			select {
+			case <-time.After(250 * time.Millisecond):
+			case <-ctx.Done():
+				return c.fail(stale, ctx.Err())
+			}
+		}
+	}
 	if err != nil {
-		return staleOrError(stale, err)
+		return c.fail(stale, err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode/100 != 2 {
-		return staleOrError(stale, fmt.Errorf("CBR HTTP %d", resp.StatusCode))
+		return c.fail(stale, fmt.Errorf("CBR HTTP %d", resp.StatusCode))
 	}
 	var feed struct {
 		Currencies []struct {
@@ -74,7 +106,7 @@ func (c *CBR) VNDToRUB(ctx context.Context) (float64, error) {
 		return nil, fmt.Errorf("unsupported CBR XML charset %q", charset)
 	}
 	if err = decoder.Decode(&feed); err != nil {
-		return staleOrError(stale, err)
+		return c.fail(stale, err)
 	}
 	for _, v := range feed.Currencies {
 		if v.Code != "VND" || v.Nominal <= 0 {
@@ -82,15 +114,23 @@ func (c *CBR) VNDToRUB(ctx context.Context) (float64, error) {
 		}
 		value, parseErr := strconv.ParseFloat(strings.ReplaceAll(v.Value, ",", "."), 64)
 		if parseErr != nil || value <= 0 {
-			return staleOrError(stale, errors.New("invalid VND rate in CBR response"))
+			return c.fail(stale, errors.New("invalid VND rate in CBR response"))
 		}
 		rate := value / float64(v.Nominal)
 		c.mu.Lock()
-		c.rate, c.until = rate, time.Now().Add(c.ttl)
+		c.rate, c.until, c.errorUntil, c.lastErr = rate, time.Now().Add(c.ttl), time.Time{}, nil
 		c.mu.Unlock()
 		return rate, nil
 	}
-	return staleOrError(stale, errors.New("VND rate is absent from CBR response"))
+	return c.fail(stale, errors.New("VND rate is absent from CBR response"))
+}
+
+func (c *CBR) fail(stale float64, err error) (float64, error) {
+	c.mu.Lock()
+	c.errorUntil = time.Now().Add(15 * time.Minute)
+	c.lastErr = err
+	c.mu.Unlock()
+	return staleOrError(stale, err)
 }
 
 func staleOrError(stale float64, err error) (float64, error) {

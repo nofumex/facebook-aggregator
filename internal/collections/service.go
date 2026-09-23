@@ -55,11 +55,29 @@ func (s *Service) Get(ctx context.Context, user int64, days int) ([]domain.Colle
 	if e != nil {
 		return nil, e
 	}
-	page, e := s.store.Search(ctx, user, domain.SearchFilter{FreshAfter: &after, Sort: "score", Limit: 500})
-	if e != nil {
-		return nil, e
+	const pageSize = 250
+	var candidates []domain.Listing
+	totalPeriod, normalized := 0, 0
+	for offset := 0; ; offset += pageSize {
+		page, e := s.store.Search(ctx, user, domain.SearchFilter{FreshAfter: &after, Sort: "score", Limit: pageSize, Offset: offset})
+		if e != nil {
+			return nil, e
+		}
+		if offset == 0 {
+			totalPeriod = page.Total
+		}
+		for _, x := range page.Items {
+			if x.ExtractionStatus == "success" {
+				normalized++
+			}
+			if IsEligible(x) {
+				candidates = append(candidates, x)
+			}
+		}
+		if len(page.Items) < pageSize || len(candidates) >= 200 || page.Items[len(page.Items)-1].DealScore < MinimumDealScore {
+			break
+		}
 	}
-	candidates := Eligible(page.Items)
 	items := make([]domain.CollectionItem, 0, 15)
 	provider := s.provider(ctx)
 	choices, curateErr := provider.Curate(ctx, candidates, 15)
@@ -85,13 +103,7 @@ func (s *Service) Get(ctx context.Context, user int64, days int) ([]domain.Colle
 	s.mu.Lock()
 	s.cache[key] = cached{items, time.Now().Add(10 * time.Minute)}
 	s.mu.Unlock()
-	normalized := 0
-	for _, x := range page.Items {
-		if x.ExtractionStatus == "success" {
-			normalized++
-		}
-	}
-	attrs := []any{"days", days, "total_period", page.Total, "normalized", normalized, "quality_passed", len(candidates), "reranked", reranked, "shortlist", min(len(candidates), 40), "selected", len(items)}
+	attrs := []any{"days", days, "total_period", totalPeriod, "normalized", normalized, "quality_passed", len(candidates), "reranked", reranked, "shortlist", min(len(candidates), 40), "selected", len(items)}
 	if len(items) > 0 {
 		oldest, newest := items[0].PublishedAt, items[0].PublishedAt
 		for _, x := range items {
