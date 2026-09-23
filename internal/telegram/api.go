@@ -91,6 +91,15 @@ func (c *Client) Send(ctx context.Context, chat int64, text string, k Markup) (M
 func (c *Client) Edit(ctx context.Context, chat int64, msg int, text string, k Markup) error {
 	return c.call(ctx, "editMessageText", map[string]any{"chat_id": chat, "message_id": msg, "text": text, "parse_mode": "HTML", "disable_web_page_preview": true, "reply_markup": k}, nil)
 }
+func (c *Client) SendPhoto(ctx context.Context, chat int64, photo, caption string, k Markup) (Message, error) {
+	var out Message
+	err := c.call(ctx, "sendPhoto", map[string]any{"chat_id": chat, "photo": photo, "caption": caption, "parse_mode": "HTML", "reply_markup": k}, &out)
+	return out, err
+}
+func (c *Client) EditPhoto(ctx context.Context, chat int64, msg int, photo, caption string, k Markup) error {
+	media := map[string]any{"type": "photo", "media": photo, "caption": caption, "parse_mode": "HTML"}
+	return c.call(ctx, "editMessageMedia", map[string]any{"chat_id": chat, "message_id": msg, "media": media, "reply_markup": k}, nil)
+}
 func (c *Client) Answer(ctx context.Context, id, text string) error {
 	return c.call(ctx, "answerCallbackQuery", map[string]any{"callback_query_id": id, "text": text}, nil)
 }

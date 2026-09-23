@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
 	"regexp"
 	"strings"
 	"time"
@@ -97,7 +98,7 @@ func (a *TeslaShibe) FetchRecent(ctx context.Context, req FetchRequest) (FetchRe
 				continue
 			}
 			raw, _ := json.Marshal(p)
-			post := domain.FacebookPost{ID: p.ID, GroupID: req.GroupID, URL: postURL(req.GroupID, p.ID), AuthorID: p.AuthorID, AuthorName: p.AuthorName, Text: p.Message, PublishedAt: p.CreatedAt, UpdatedAt: p.UpdatedAt, MediaURLs: p.Attachments, Raw: raw}
+			post := domain.FacebookPost{ID: p.ID, GroupID: req.GroupID, URL: postURL(req.GroupID, p.ID), AuthorID: p.AuthorID, AuthorName: p.AuthorName, Text: p.Message, PublishedAt: p.CreatedAt, UpdatedAt: p.UpdatedAt, MediaURLs: imageURLs(p.Attachments), Raw: raw}
 			out.Posts = append(out.Posts, post)
 			if out.NewestAt.IsZero() || p.CreatedAt.After(out.NewestAt) {
 				out.NewestAt, out.NewestID = p.CreatedAt, p.ID
@@ -108,6 +109,27 @@ func (a *TeslaShibe) FetchRecent(ctx context.Context, req FetchRequest) (FetchRe
 		}
 	}
 	return out, nil
+}
+
+// The upstream attachment tree also contains post, profile and outbound-link
+// URLs. Persist only actual image resources so Telegram never tries to render a
+// Facebook page or a video as a photo.
+func imageURLs(items []string) []string {
+	seen := map[string]bool{}
+	out := make([]string, 0, len(items))
+	for _, raw := range items {
+		u, err := url.Parse(strings.TrimSpace(raw))
+		if err != nil || (u.Scheme != "https" && u.Scheme != "http") {
+			continue
+		}
+		host, path := strings.ToLower(u.Hostname()), strings.ToLower(u.Path)
+		valid := strings.Contains(host, "scontent") || strings.HasSuffix(path, ".jpg") || strings.HasSuffix(path, ".jpeg") || strings.HasSuffix(path, ".png") || strings.HasSuffix(path, ".webp")
+		if valid && !seen[raw] {
+			seen[raw] = true
+			out = append(out, raw)
+		}
+	}
+	return out
 }
 
 var digits = regexp.MustCompile(`^\d+$`)

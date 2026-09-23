@@ -32,7 +32,7 @@ func TestVietnameseListing(t *testing.T) {
 	}
 }
 func TestPrices(t *testing.T) {
-	cases := map[string]int64{"5tr": 5_000_000, "5tr500": 5_500_000, "5.5tr": 5_500_000, "5,5 triệu": 5_500_000, "5000k": 5_000_000, "5 million": 5_000_000}
+	cases := map[string]int64{"5tr": 5_000_000, "5tr500": 5_500_000, "5 triệu 500": 5_500_000, "5.5tr": 5_500_000, "5,5 triệu": 5_500_000, "5000k": 5_000_000, "5 million": 5_000_000, "12 000 000 đ": 12_000_000, "7 củ": 7_000_000}
 	for s, want := range cases {
 		l := parse(t, "rent "+s+" / month")
 		var got int64
@@ -42,6 +42,13 @@ func TestPrices(t *testing.T) {
 		if got != want {
 			t.Errorf("%s got %d want %d raw=%v", s, got, want, l.RawValues)
 		}
+	}
+}
+
+func TestPriceRangeWithUnitsOnBothSides(t *testing.T) {
+	l := parse(t, "Cho thuê căn hộ 2PN, giá 6tr - 7tr/tháng")
+	if l.RentMin == nil || l.RentMax == nil || *l.RentMin != 6_000_000 || *l.RentMax != 7_000_000 {
+		t.Fatalf("range=%v-%v raw=%v", l.RentMin, l.RentMax, l.RawValues)
 	}
 }
 func TestFeeNotRent(t *testing.T) {

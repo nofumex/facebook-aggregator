@@ -22,3 +22,14 @@ func TestMergeIncrementalFeed(t *testing.T) {
 		t.Fatalf("%+v", page)
 	}
 }
+
+func TestAttachmentCollectsNestedAlbumImages(t *testing.T) {
+	var attachment fbAttachment
+	raw := []byte(`{"styles":{"attachment":{"subattachments":{"nodes":[{"media":{"image":{"uri":"https://scontent.fbcdn.net/one.jpg"}}},{"media":{"image":{"uri":"https://scontent.fbcdn.net/two.jpg"}}}]}}}}`)
+	if err := json.Unmarshal(raw, &attachment); err != nil {
+		t.Fatal(err)
+	}
+	if len(attachment.URLs) != 2 || attachment.URLs[0] != "https://scontent.fbcdn.net/one.jpg" || attachment.URLs[1] != "https://scontent.fbcdn.net/two.jpg" {
+		t.Fatalf("urls=%v", attachment.URLs)
+	}
+}

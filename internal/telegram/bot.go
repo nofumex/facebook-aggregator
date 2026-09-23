@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"html"
 	"log/slog"
+	"math"
+	"net/url"
 	"strconv"
 	"strings"
 	"sync"
@@ -14,6 +16,7 @@ import (
 
 	"github.com/egori/facebook-aggregator/internal/collections"
 	"github.com/egori/facebook-aggregator/internal/domain"
+	"github.com/egori/facebook-aggregator/internal/exchange"
 	fbadapter "github.com/egori/facebook-aggregator/internal/facebook"
 	"github.com/egori/facebook-aggregator/internal/llm"
 	"github.com/egori/facebook-aggregator/internal/parser"
@@ -28,6 +31,7 @@ type Bot struct {
 	sync        *syncer.Service
 	fb          fbadapter.Adapter
 	collections *collections.Service
+	rates       exchange.Provider
 	admins      map[int64]bool
 	cipher      *secrets.Cipher
 	log         *slog.Logger
@@ -48,7 +52,7 @@ type pageCache struct {
 }
 
 func NewBot(api *Client, store *storage.Store, sync *syncer.Service, fb fbadapter.Adapter, c *collections.Service, admins map[int64]bool, cipher *secrets.Cipher, log *slog.Logger, poll time.Duration) *Bot {
-	return &Bot{api: api, store: store, sync: sync, fb: fb, collections: c, admins: admins, cipher: cipher, log: log, defaultPoll: poll, states: map[int64]string{}, filters: map[int64]domain.SearchFilter{}, pages: map[string]pageCache{}}
+	return &Bot{api: api, store: store, sync: sync, fb: fb, collections: c, rates: exchange.NewCBR(), admins: admins, cipher: cipher, log: log, defaultPoll: poll, states: map[int64]string{}, filters: map[int64]domain.SearchFilter{}, pages: map[string]pageCache{}}
 }
 
 func (b *Bot) Run(ctx context.Context) error {
@@ -129,6 +133,12 @@ func (b *Bot) callback(ctx context.Context, q *CallbackQuery) {
 		b.listAction(ctx, q, false, parts)
 	case "detail":
 		b.showDetails(ctx, q, parts)
+	case "photos":
+		b.openPhotos(ctx, q, parts)
+	case "photo":
+		b.turnPhoto(ctx, q, parts)
+	case "closephoto":
+		_ = b.api.Delete(ctx, q.Message.Chat.ID, q.Message.MessageID)
 	case "collections":
 		b.showCollections(ctx, q)
 	case "col":
@@ -342,7 +352,8 @@ func (b *Bot) renderCard(ctx context.Context, chat int64, msg int, token string,
 	if reason := c.reasons[l.ID]; reason != "" {
 		head += fmt.Sprintf("\n\n🔥 <b>#%d</b>\n<i>%s</i>", idx+1, html.EscapeString(reason))
 	}
-	text := head + "\n\n" + card(l)
+	rate := b.vndToRUB(ctx)
+	text := head + "\n\n" + card(l, rate)
 	prev := idx - 1
 	if prev < 0 {
 		prev = 0
@@ -353,10 +364,15 @@ func (b *Bot) renderCard(ctx context.Context, chat int64, msg int, token string,
 			next = len(c.items) - 1
 		}
 	}
-	k := Markup{[][]Button{{urlb("Открыть Facebook", l.FacebookURL)}, {cb("❤️ Сохранить", fmt.Sprintf("save:%d", l.ID)), cb("🙈 Скрыть", fmt.Sprintf("hide:%d", l.ID)), cb("Подробнее", fmt.Sprintf("detail:%d", l.ID))}, {cb("◀️", fmt.Sprintf("page:%s:%d", token, prev)), cb(fmt.Sprintf("%d/%d", idx+1, c.total), "noop"), cb("▶️", fmt.Sprintf("page:%s:%d", token, next))}, {cb("← Меню", "menu")}}}
+	rows := [][]Button{{urlb("Открыть Facebook", l.FacebookURL)}}
+	if n := len(photoURLs(l.MediaURLs)); n > 0 {
+		rows = append(rows, []Button{cb(fmt.Sprintf("📷 Фото · %d", n), fmt.Sprintf("photos:%d", l.ID))})
+	}
+	rows = append(rows, []Button{cb("❤️ Сохранить", fmt.Sprintf("save:%d", l.ID)), cb("🙈 Скрыть", fmt.Sprintf("hide:%d", l.ID)), cb("Подробнее", fmt.Sprintf("detail:%d", l.ID))}, []Button{cb("◀️", fmt.Sprintf("page:%s:%d", token, prev)), cb(fmt.Sprintf("%d/%d", idx+1, c.total), "noop"), cb("▶️", fmt.Sprintf("page:%s:%d", token, next))}, []Button{cb("← Меню", "menu")})
+	k := Markup{rows}
 	b.editOrSend(ctx, chat, msg, text, k)
 }
-func card(l domain.Listing) string {
+func card(l domain.Listing, vndToRUB float64) string {
 	var lines []string
 	kind := map[string]string{"apartment": "Квартира", "house": "Дом", "room": "Комната", "studio": "Студия"}[l.PropertyType]
 	var specs []string
@@ -381,10 +397,21 @@ func card(l domain.Listing) string {
 	}
 	if l.RentMin != nil {
 		price := money(*l.RentMin)
+		roubles := ""
 		if l.RentMax != nil && *l.RentMax != *l.RentMin {
 			price += "–" + money(*l.RentMax)
+			if vndToRUB > 0 {
+				roubles = money(int64(math.Round(float64(*l.RentMin)*vndToRUB))) + "–" + money(int64(math.Round(float64(*l.RentMax)*vndToRUB)))
+			}
+		} else if vndToRUB > 0 {
+			roubles = money(int64(math.Round(float64(*l.RentMin) * vndToRUB)))
 		}
-		lines = append(lines, "\n💰 <b>"+price+" ₫ / мес.</b>")
+		if roubles != "" {
+			price += " ₫ (≈ " + roubles + " ₽)"
+		} else {
+			price += " ₫"
+		}
+		lines = append(lines, "\n💰 <b>"+price+" / мес.</b>")
 	}
 	if gov, ok := l.Utilities["government_rate"].(bool); ok && gov {
 		lines = append(lines, "⚡ Электричество и вода: гос. тариф")
@@ -405,9 +432,102 @@ func (b *Bot) showDetails(ctx context.Context, q *CallbackQuery, p []string) {
 		b.fail(ctx, q.Message.Chat.ID, q.Message.MessageID, e)
 		return
 	}
-	text := card(l) + "\n\n<b>Исходное объявление</b>\n" + html.EscapeString(truncate(l.OriginalText, 1800))
+	text := card(l, b.vndToRUB(ctx)) + "\n\n<b>Исходное объявление</b>\n" + html.EscapeString(truncate(l.OriginalText, 1800))
 	k := Markup{[][]Button{{urlb("Открыть Facebook", l.FacebookURL)}, {cb("← Назад", "menu")}}}
 	b.editOrSend(ctx, q.Message.Chat.ID, q.Message.MessageID, text, k)
+}
+
+func (b *Bot) vndToRUB(ctx context.Context) float64 {
+	if b.rates == nil {
+		return 0
+	}
+	rate, err := b.rates.VNDToRUB(ctx)
+	if err != nil {
+		if b.log != nil {
+			b.log.Warn("exchange rate unavailable", "error", err)
+		}
+		return 0
+	}
+	return rate
+}
+
+func (b *Bot) openPhotos(ctx context.Context, q *CallbackQuery, p []string) {
+	if len(p) < 2 {
+		return
+	}
+	id, _ := strconv.ParseInt(p[1], 10, 64)
+	l, err := b.store.Listing(ctx, id)
+	if err != nil {
+		b.fail(ctx, q.Message.Chat.ID, q.Message.MessageID, err)
+		return
+	}
+	photos := photoURLs(l.MediaURLs)
+	if len(photos) == 0 {
+		_ = b.api.Answer(ctx, q.ID, "В этом объявлении фотографии недоступны")
+		return
+	}
+	_, err = b.api.SendPhoto(ctx, q.Message.Chat.ID, photos[0], photoCaption(l, 0, len(photos)), photoKeyboard(l, 0, len(photos)))
+	if err != nil && b.log != nil {
+		b.log.Warn("telegram photo", "error", err)
+	}
+}
+
+func (b *Bot) turnPhoto(ctx context.Context, q *CallbackQuery, p []string) {
+	if len(p) < 3 {
+		return
+	}
+	id, _ := strconv.ParseInt(p[1], 10, 64)
+	idx, _ := strconv.Atoi(p[2])
+	l, err := b.store.Listing(ctx, id)
+	if err != nil {
+		return
+	}
+	photos := photoURLs(l.MediaURLs)
+	if len(photos) == 0 {
+		return
+	}
+	if idx < 0 {
+		idx = 0
+	}
+	if idx >= len(photos) {
+		idx = len(photos) - 1
+	}
+	if err = b.api.EditPhoto(ctx, q.Message.Chat.ID, q.Message.MessageID, photos[idx], photoCaption(l, idx, len(photos)), photoKeyboard(l, idx, len(photos))); err != nil && b.log != nil {
+		b.log.Warn("telegram photo pagination", "error", err)
+	}
+}
+
+func photoCaption(l domain.Listing, idx, total int) string {
+	return fmt.Sprintf("<b>Фото %d/%d</b> · объявление #%d", idx+1, total, l.ID)
+}
+
+func photoKeyboard(l domain.Listing, idx, total int) Markup {
+	prev, next := idx-1, idx+1
+	if prev < 0 {
+		prev = 0
+	}
+	if next >= total {
+		next = total - 1
+	}
+	return Markup{[][]Button{{cb("◀️", fmt.Sprintf("photo:%d:%d", l.ID, prev)), cb(fmt.Sprintf("%d/%d", idx+1, total), "noop"), cb("▶️", fmt.Sprintf("photo:%d:%d", l.ID, next))}, {urlb("Открыть пост", l.FacebookURL), cb("✕ Закрыть", "closephoto")}}}
+}
+
+func photoURLs(items []string) []string {
+	seen := map[string]bool{}
+	out := make([]string, 0, len(items))
+	for _, raw := range items {
+		u, err := url.Parse(raw)
+		if err != nil || (u.Scheme != "https" && u.Scheme != "http") {
+			continue
+		}
+		host, path := strings.ToLower(u.Hostname()), strings.ToLower(u.Path)
+		isImage := strings.Contains(host, "scontent") || (strings.Contains(host, "fbcdn.net") && !strings.HasPrefix(host, "video")) || strings.HasSuffix(path, ".jpg") || strings.HasSuffix(path, ".jpeg") || strings.HasSuffix(path, ".png") || strings.HasSuffix(path, ".webp")
+		if isImage && !seen[raw] {
+			seen[raw] = true
+			out = append(out, raw)
+		}
+	}
+	return out
 }
 func (b *Bot) listAction(ctx context.Context, q *CallbackQuery, save bool, p []string) {
 	if len(p) < 2 {
@@ -454,7 +574,7 @@ func (b *Bot) showMarket(ctx context.Context, q *CallbackQuery) {
 }
 func (b *Bot) showCollections(ctx context.Context, q *CallbackQuery) {
 	k := Markup{[][]Button{{cb("Сегодня", "col:1"), cb("7 дней", "col:7"), cb("30 дней", "col:30")}, {cb("← Меню", "menu")}}}
-	b.editOrSend(ctx, q.Message.Chat.ID, q.Message.MessageID, "<b>🔥 Подборки</b>\n\nЛокальный ranking отбирает лучшие варианты. Если LLM доступен, он только улучшает shortlist; при любой ошибке подборка остаётся доступной.", k)
+	b.editOrSend(ctx, q.Message.Chat.ID, q.Message.MessageID, "<b>🔥 Подборки</b>\n\nСюда попадают только объявления с надёжно извлечённой ценой, достаточными характеристиками и высоким рейтингом. Если включён LLM, он дополнительно проверяет исходный текст и делает финальный отбор.", k)
 }
 func (b *Bot) runCollection(ctx context.Context, q *CallbackQuery, p []string) {
 	days := 7
@@ -471,6 +591,10 @@ func (b *Bot) runCollection(ctx context.Context, q *CallbackQuery, p []string) {
 	for _, x := range items {
 		list = append(list, x.Listing)
 		reasons[x.ID] = x.Reason
+	}
+	if len(list) == 0 {
+		b.editOrSend(ctx, q.Message.Chat.ID, q.Message.MessageID, "<b>🔥 Лучшие "+collections.Title(days)+"</b>\n\nПока нет вариантов, которые прошли строгую проверку данных и качества. Слабые или неполные объявления в подборку не добавлены.", back("collections"))
+		return
 	}
 	b.cacheAndShow(ctx, q.Message.Chat.ID, q.Message.MessageID, q.From.ID, list, len(list), "🔥 Лучшие "+collections.Title(days), reasons, nil)
 }

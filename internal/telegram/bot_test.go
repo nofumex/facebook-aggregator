@@ -46,3 +46,19 @@ func TestMainMenuAndCardEditFlows(t *testing.T) {
 		t.Fatalf("menu=%q card=%q calls=%v", menu, card, calls)
 	}
 }
+
+func TestCardAddsRoubleEquivalent(t *testing.T) {
+	rent := int64(8_000_000)
+	text := card(domain.Listing{RentMin: &rent, RentMax: &rent, PublishedAt: time.Now(), Utilities: map[string]any{}}, .003125)
+	if !strings.Contains(text, "8 000 000 ₫ (≈ 25 000 ₽)") {
+		t.Fatalf("card=%q", text)
+	}
+}
+
+func TestPhotoURLsKeepsFacebookImagesOnly(t *testing.T) {
+	photo := "https://scontent.xx.fbcdn.net/v/room.jpg?x=1"
+	got := photoURLs([]string{photo, photo, "https://facebook.com/groups/1/posts/2", "https://video.xx.fbcdn.net/clip.mp4"})
+	if len(got) != 1 || got[0] != photo {
+		t.Fatalf("photos=%v", got)
+	}
+}

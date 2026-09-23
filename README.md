@@ -87,6 +87,8 @@ The main UI uses edited messages and inline keyboards:
 - free text such as `2 спальни son tra до 6 млн` or `near beach 1pn` is parsed locally;
 - `🔥 Подборки` — today, 7 days, 30 days;
 - `❤️ Избранное`, hide and details actions;
+- listing cards show the live VND equivalent in RUB using the cached official Bank of Russia daily rate;
+- Facebook photos are stored with the post and opened as an in-chat `◀️/▶️` gallery;
 - `🛠 Админка` — visible only to `TELEGRAM_ADMIN_IDS`.
 
 Search result snapshots are cached for five minutes, so `◀️/▶️` pagination only edits the existing Telegram message and does not rerun the database query. Callback queries are acknowledged before work begins; DB, Facebook and LLM tasks execute outside the polling loop.
@@ -97,11 +99,13 @@ The LLM admin supports enable/disable, provider (`openai` or `compatible`), base
 
 ## Normalization and ranking
 
-The rule parser retains `original_text`, raw money mentions and per-field confidence. It handles common Vietnamese/English forms such as `5tr`, `5tr5`, `5tr500`, `5.5tr`, `5,5 triệu`, `5 million`, `5000k`, ranges, deposits and utilities. Price mentions are classified from their clause so electricity/water/deposit values are not treated as rent. Unknown fields never reject a post.
+The rule parser retains `original_text`, raw money mentions and per-field confidence. It handles common Vietnamese/English forms such as `5tr`, `5tr5`, `5tr500`, `5 triệu 500`, `5.5tr`, `5,5 triệu`, `7 củ`, full VND amounts, ranges, deposits and utilities. Price mentions are classified from their clause so electricity/water/deposit values are not treated as rent. Unknown fields do not prevent archival/search storage.
 
 District, property type, bedrooms/studio, area, furnishing, beach distance, amenities, pets, foreigner acceptance, temporary residence and lease terms are extracted best-effort. Add regression examples to `internal/parser/parser_test.go` whenever a new real-world syntax appears.
 
 `deal_score` is modular and favors value for money against the median of comparable district/type/bedroom listings over 180 days. It also considers price per m², freshness, completeness, beach, furniture, amenities, utilities, foreigner friendliness, deposit and sample size. Sparse data shrinks the result toward neutral instead of strongly penalizing missing fields. Weights live in `internal/ranking` and can be moved to application settings without changing the scoring interface.
+
+Collections have a stricter admission gate than search: reliable parsed rent, at least two core property facts, `deal_score >= 62`, and score confidence `>= 0.65`. The quota is never padded with incomplete listings. When LLM mode is enabled, only admitted candidates are sent together with their source text and confidence data; the LLM may return fewer candidates or none.
 
 ## Incremental polling behavior
 

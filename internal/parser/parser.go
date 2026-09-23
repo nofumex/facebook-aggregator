@@ -16,9 +16,9 @@ type Parser struct{}
 func New() *Parser { return &Parser{} }
 
 var (
-	priceRE         = regexp.MustCompile(`(?i)(\d{1,3}(?:[.,]\d{1,3})?)\s*(?:-|–|—|đến|to)\s*(\d{1,3}(?:[.,]\d{1,3})?)\s*(tr(?:iệu)?|m(?:illion)?|млн)(?:\b|\s|/|$)|\b(\d{1,3})\s*(?:tr|triệu|m)(\d{1,3})\b|\b(\d{1,7}(?:[.,]\d{1,3})*)\s*(tr(?:iệu)?|million|m|млн|k|nghìn|vnd|vnđ|đ)(?:\b|\s|/|$)`)
-	bedRE           = regexp.MustCompile(`(?i)\b([1-9])\s*(?:pn|phòng\s*ngủ|br|bed(?:room)?s?)\b`)
-	areaRE          = regexp.MustCompile(`(?i)\b(\d{1,3}(?:[.,]\d)?)\s*(?:m2|m²|sqm|sq\.?\s*m)(?:\b|\s|$)`)
+	priceRE         = regexp.MustCompile(`(?i)\b\d{1,3}\s*(?:tr|triệu|million|m|млн)\s*\d{1,3}(?:\s*(?:k|nghìn))?\b|\b\d{1,3}(?:[.,]\d{1,3})?\s*(?:tr|triệu|million|m|млн|củ|chai)\s*(?:-|–|—|đến|to)\s*\d{1,3}(?:[.,]\d{1,3})?\s*(?:tr|triệu|million|m|млн|củ|chai)(?:\b|\s|/|$)|\b\d{1,3}(?:[.,]\d{1,3})?\s*(?:-|–|—|đến|to)\s*\d{1,3}(?:[.,]\d{1,3})?\s*(?:tr|triệu|million|m|млн|củ|chai)(?:\b|\s|/|$)|\b(?:\d{1,3}(?:[.,\s]\d{3}){2,}|\d{1,9}(?:[.,]\d{1,3})?)\s*(?:tr|triệu|million|m|млн|củ|chai|k|nghìn|vnd|vnđ|₫|đ)(?:\b|\s|/|$)`)
+	bedRE           = regexp.MustCompile(`(?i)\b([1-9])\s*(?:pn|p\.ngủ|phòng\s*ngủ|br|bdr|bed(?:room)?s?|спальн(?:я|и|ь|ей)?)\b`)
+	areaRE          = regexp.MustCompile(`(?i)\b(\d{1,3}(?:[.,]\d)?)\s*(?:m2|m²|m\^2|sqm|sq\.?\s*m)(?:\b|\s|$)`)
 	distanceRE      = regexp.MustCompile(`(?i)(\d{1,4})\s*(m|km)\s*(?:tới|đến|from|to)?\s*(?:biển|beach)`)
 	distanceAfterRE = regexp.MustCompile(`(?i)(?:biển|beach)\D{0,20}(\d{1,4})\s*(m|km)\b`)
 	leaseRE         = regexp.MustCompile(`(?i)(?:hợp đồng|lease|thuê)\s*(?:từ|min(?:imum)?|:)?\s*(\d{1,2})\s*(?:tháng|months?)`)
@@ -173,11 +173,14 @@ func parseMoneyRaw(raw string) (int64, int64) {
 	s = strings.ReplaceAll(s, "triệu", "tr")
 	s = strings.ReplaceAll(s, "million", "m")
 	s = strings.ReplaceAll(s, "млн", "m")
+	s = strings.ReplaceAll(s, "củ", "m")
+	s = strings.ReplaceAll(s, "chai", "m")
 	s = strings.ReplaceAll(s, "vnđ", "vnd")
+	s = strings.ReplaceAll(s, "₫", "đ")
 	s = strings.ReplaceAll(s, "đến", "-")
 	s = strings.ReplaceAll(s, "–", "-")
 	s = strings.ReplaceAll(s, "—", "-")
-	if m := regexp.MustCompile(`^(\d{1,3})\s*(?:tr|m)(\d{1,3})$`).FindStringSubmatch(s); len(m) > 0 {
+	if m := regexp.MustCompile(`^(\d{1,3})\s*(?:tr|m)\s*(\d{1,3})(?:\s*(?:k|nghìn))?$`).FindStringSubmatch(s); len(m) > 0 {
 		a, _ := strconv.ParseInt(m[1], 10, 64)
 		b, _ := strconv.ParseInt(m[2], 10, 64)
 		mul := int64(100000)
@@ -196,7 +199,7 @@ func parseMoneyRaw(raw string) (int64, int64) {
 			break
 		}
 	}
-	clean := regexp.MustCompile(`[^0-9,.-]`).ReplaceAllString(s, "")
+	clean := regexp.MustCompile(`[^0-9,.-]`).ReplaceAllString(strings.ReplaceAll(s, " ", ""), "")
 	parts := strings.Split(clean, "-")
 	vals := make([]int64, 0, 2)
 	for _, x := range parts {
@@ -228,11 +231,11 @@ func parseMoneyRaw(raw string) (int64, int64) {
 
 func propertyType(s string) string {
 	switch {
-	case containsAny(s, "nhà nguyên căn", "whole house", "entire house"):
+	case containsAny(s, "nhà nguyên căn", "whole house", "entire house", "villa", "biệt thự", "townhouse"):
 		return "house"
 	case containsAny(s, "phòng trọ", "phòng cho thuê", "room for rent"):
 		return "room"
-	case containsAny(s, "căn hộ", "chung cư", "apartment", "condo"):
+	case containsAny(s, "căn hộ", "chung cư", "apartment", "condo", "apt"):
 		return "apartment"
 	}
 	return ""
@@ -277,9 +280,11 @@ func estimateTotal(l domain.Listing) (*int64, *int64) {
 	return &a, &b
 }
 func priceConfidence(s string, n int) float64 {
-	c := .68
-	if containsAny(s, "giá thuê", "rent", "monthly", "/tháng", "tháng") {
-		c += .2
+	c := .62
+	if containsAny(s, "giá thuê", "cho thuê", "rent", "monthly", "per month", "/tháng", "/ tháng", "tháng") {
+		c += .25
+	} else if containsAny(s, "giá", "price") {
+		c += .15
 	}
 	if n > 2 {
 		c -= .12

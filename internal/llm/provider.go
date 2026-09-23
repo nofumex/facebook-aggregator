@@ -99,20 +99,24 @@ func (p *OpenAICompatible) Curate(ctx context.Context, items []domain.Listing, l
 	type compact struct {
 		ID                        int64    `json:"id"`
 		Rent                      *int64   `json:"rent"`
+		RentMax                   *int64   `json:"rent_max,omitempty"`
 		Beds                      *int     `json:"beds"`
 		Area                      *float64 `json:"area"`
 		District, Type, Furnished string
 		NearBeach, Foreigners     *bool
 		Amenities                 map[string]bool
 		Score                     float64
+		ScoreConfidence           float64           `json:"score_confidence"`
+		FieldConfidence           domain.Confidence `json:"field_confidence"`
+		SourceText                string            `json:"source_text"`
 	}
 	in := make([]compact, 0, len(items))
 	for _, x := range items {
-		in = append(in, compact{x.ID, x.RentMin, x.Bedrooms, x.AreaM2, x.District, x.PropertyType, x.Furnished, x.NearBeach, x.ForeignersAccepted, x.Amenities, x.DealScore})
+		in = append(in, compact{ID: x.ID, Rent: x.RentMin, RentMax: x.RentMax, Beds: x.Bedrooms, Area: x.AreaM2, District: x.District, Type: x.PropertyType, Furnished: x.Furnished, NearBeach: x.NearBeach, Foreigners: x.ForeignersAccepted, Amenities: x.Amenities, Score: x.DealScore, ScoreConfidence: x.ScoreConfidence, FieldConfidence: x.Confidence, SourceText: truncateRunes(x.OriginalText, 900)})
 	}
 	data, _ := json.Marshal(in)
-	prompt := fmt.Sprintf("Select up to %d best value-for-money Da Nang rentals. Return ONLY JSON object {\"choices\":[{\"listing_id\":123,\"reason\":\"short Russian reason\"}]}. Never invent facts. Candidates: %s", limit, data)
-	body := map[string]any{"model": p.cfg.Model, "messages": []map[string]string{{"role": "system", "content": "You curate rental listings. Prefer value, sufficient evidence, and diversity. Output strict JSON."}, {"role": "user", "content": prompt}}, "response_format": map[string]string{"type": "json_object"}, "temperature": p.cfg.Temperature}
+	prompt := fmt.Sprintf("Select at most %d genuinely exceptional value-for-money Da Nang rentals. You may return fewer or none: never fill a quota. Cross-check every structured fact against source_text, reject contradictions, ambiguous prices, missing essentials, non-rental posts and weak evidence. Rank only the strongest deals. Return ONLY JSON object {\"choices\":[{\"listing_id\":123,\"reason\":\"specific short Russian reason citing verified facts\"}]}. Never invent facts. Candidates: %s", limit, data)
+	body := map[string]any{"model": p.cfg.Model, "messages": []map[string]string{{"role": "system", "content": "You are a strict rental analyst and final quality gate. Precision is more important than recall. Output strict JSON."}, {"role": "user", "content": prompt}}, "response_format": map[string]string{"type": "json_object"}, "temperature": p.cfg.Temperature}
 	if p.cfg.MaxTokens > 0 {
 		body["max_tokens"] = p.cfg.MaxTokens
 	}
@@ -158,13 +162,21 @@ func (p *OpenAICompatible) Curate(ctx context.Context, items []domain.Listing, l
 	seen := map[int64]bool{}
 	valid := out.Choices[:0]
 	for _, x := range out.Choices {
-		if allowed[x.ListingID] && !seen[x.ListingID] {
+		if allowed[x.ListingID] && !seen[x.ListingID] && strings.TrimSpace(x.Reason) != "" {
 			seen[x.ListingID] = true
 			x.Reason = strings.TrimSpace(x.Reason)
 			valid = append(valid, x)
 		}
 	}
 	return valid, nil
+}
+
+func truncateRunes(s string, n int) string {
+	r := []rune(s)
+	if len(r) <= n {
+		return s
+	}
+	return string(r[:n])
 }
 func (p *OpenAICompatible) acquire(ctx context.Context) error {
 	select {
