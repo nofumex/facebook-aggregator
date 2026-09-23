@@ -321,7 +321,7 @@ func (p *OpenAICompatible) AvailableModels(ctx context.Context) ([]string, error
 	return ids, nil
 }
 
-func normalizeEnrichmentJSON(raw []byte, allowMissingNullable bool) ([]byte, error) {
+func normalizeEnrichmentJSON(raw []byte, compatibleJSONMode bool) ([]byte, error) {
 	keys := enrichmentKeys()
 	allowed := map[string]bool{}
 	for _, key := range keys {
@@ -333,13 +333,17 @@ func normalizeEnrichmentJSON(raw []byte, allowMissingNullable bool) ([]byte, err
 	}
 	for key := range object {
 		if !allowed[key] {
+			if compatibleJSONMode {
+				delete(object, key)
+				continue
+			}
 			return nil, fmt.Errorf("invalid enrichment JSON: unknown field %s", key)
 		}
 	}
 	if _, ok := object["is_rental_listing"]; !ok {
 		return nil, fmt.Errorf("invalid enrichment JSON: missing is_rental_listing")
 	}
-	if !allowMissingNullable {
+	if !compatibleJSONMode {
 		for _, key := range keys {
 			if _, ok := object[key]; !ok {
 				return nil, fmt.Errorf("invalid enrichment JSON: missing %s", key)
@@ -355,26 +359,26 @@ func normalizeEnrichmentJSON(raw []byte, allowMissingNullable bool) ([]byte, err
 		object["district"] = json.RawMessage(`"Unknown"`)
 	}
 	var err error
-	object["utilities"], err = normalizeNullableObject(object["utilities"], []string{"electricity_vnd_per_kwh", "water_vnd_per_person", "water_vnd_per_month", "wifi_vnd_per_month", "service_vnd_per_month", "parking_vnd_per_month"}, false)
+	object["utilities"], err = normalizeNullableObject(object["utilities"], []string{"electricity_vnd_per_kwh", "water_vnd_per_person", "water_vnd_per_month", "wifi_vnd_per_month", "service_vnd_per_month", "parking_vnd_per_month"}, false, compatibleJSONMode)
 	if err != nil {
 		return nil, fmt.Errorf("invalid utilities: %w", err)
 	}
-	object["amenities"], err = normalizeNullableObject(object["amenities"], []string{"balcony", "private_washing_machine", "washing_machine", "elevator", "air_conditioning", "kitchen", "pool", "gym", "parking"}, false)
+	object["amenities"], err = normalizeNullableObject(object["amenities"], []string{"balcony", "private_washing_machine", "washing_machine", "elevator", "air_conditioning", "kitchen", "pool", "gym", "parking"}, false, compatibleJSONMode)
 	if err != nil {
 		return nil, fmt.Errorf("invalid amenities: %w", err)
 	}
-	object["restrictions"], err = normalizeNullableObject(object["restrictions"], []string{"electric_bike_allowed"}, false)
+	object["restrictions"], err = normalizeNullableObject(object["restrictions"], []string{"electric_bike_allowed"}, false, compatibleJSONMode)
 	if err != nil {
 		return nil, fmt.Errorf("invalid restrictions: %w", err)
 	}
-	object["confidence"], err = normalizeNullableObject(object["confidence"], confidenceKeys(), true)
+	object["confidence"], err = normalizeNullableObject(object["confidence"], confidenceKeys(), true, compatibleJSONMode)
 	if err != nil {
 		return nil, fmt.Errorf("invalid confidence: %w", err)
 	}
 	return json.Marshal(object)
 }
 
-func normalizeNullableObject(raw json.RawMessage, keys []string, zero bool) (json.RawMessage, error) {
+func normalizeNullableObject(raw json.RawMessage, keys []string, zero, dropUnknown bool) (json.RawMessage, error) {
 	if len(raw) == 0 || string(raw) == "null" {
 		raw = json.RawMessage(`{}`)
 	}
@@ -388,6 +392,10 @@ func normalizeNullableObject(raw json.RawMessage, keys []string, zero bool) (jso
 	}
 	for key := range object {
 		if !allowed[key] {
+			if dropUnknown {
+				delete(object, key)
+				continue
+			}
 			return nil, fmt.Errorf("unknown field %s", key)
 		}
 	}
