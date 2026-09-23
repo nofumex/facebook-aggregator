@@ -36,6 +36,7 @@ type LLMExtraction struct {
 	Concurrency   int
 	SchemaVersion string
 	Models        []string
+	AutoModel     string
 	ModelTimeouts map[string]time.Duration
 	RetryBase     time.Duration
 	MaxAttempts   int
@@ -60,6 +61,7 @@ func Load() (Config, error) {
 			Enabled: boolEnv("LLM_EXTRACTION_ENABLED", false), BaseURL: strings.TrimRight(os.Getenv("LLM_EXTRACTION_BASE_URL"), "/"), APIKey: os.Getenv("LLM_EXTRACTION_API_KEY"),
 			Timeout: duration("LLM_EXTRACTION_TIMEOUT", 25*time.Second), Concurrency: integer("LLM_EXTRACTION_CONCURRENCY", 2), SchemaVersion: env("LLM_EXTRACTION_SCHEMA_VERSION", "rental-v1"),
 			Models:        csv(env("LLM_EXTRACTION_MODELS", "ministral-3-8b,gpt-oss-20b,gemma-sea-lion-v4-27b,gemini-3.5-flash-lite")),
+			AutoModel:     strings.TrimSpace(os.Getenv("LLM_EXTRACTION_AUTO_MODEL")),
 			ModelTimeouts: durationMap(os.Getenv("LLM_EXTRACTION_MODEL_TIMEOUTS")), RetryBase: duration("LLM_EXTRACTION_RETRY_BASE", 500*time.Millisecond), MaxAttempts: integer("LLM_EXTRACTION_MAX_ATTEMPTS", 4),
 		},
 		Facebook: Facebook{SB: envAny("FB_SB", "FACEBOOK_SB"), DATR: envAny("FB_DATR", "FACEBOOK_DATR"), CUser: envAny("FB_CUSER", "FACEBOOK_C_USER"), XS: envAny("FB_XS", "FACEBOOK_XS"), FR: envAny("FB_FR", "FACEBOOK_FR"), PSL: envAny("FB_PSL", "FACEBOOK_PS_L"), PSN: envAny("FB_PSN", "FACEBOOK_PS_N"), MinRequestGap: duration("FB_MIN_REQUEST_GAP", 1200*time.Millisecond), MaxRetries: integer("FB_MAX_RETRIES", 4), DisableHTTP2: boolEnv("FB_DISABLE_HTTP2", false), DocIDs: parseMap(os.Getenv("FB_DOC_IDS"))},

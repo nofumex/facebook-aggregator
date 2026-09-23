@@ -34,12 +34,15 @@ type Cache interface {
 // Service performs semantic extraction once per cleaned content hash and schema version.
 // It is intentionally separate from the optional final collection curator.
 type Service struct {
-	cfg    config.LLMExtraction
-	cache  Cache
-	log    *slog.Logger
-	mu     sync.Mutex
-	models []string
-	sem    chan struct{}
+	cfg        config.LLMExtraction
+	cache      Cache
+	log        *slog.Logger
+	mu         sync.Mutex
+	discovered bool
+	models     []string
+	autoModel  string
+	cooldown   map[string]time.Time
+	sem        chan struct{}
 }
 
 func New(cfg config.LLMExtraction, cache Cache, log *slog.Logger) *Service {
@@ -50,7 +53,7 @@ func New(cfg config.LLMExtraction, cache Cache, log *slog.Logger) *Service {
 	if concurrency < 1 {
 		concurrency = 1
 	}
-	return &Service{cfg: cfg, cache: cache, log: log, sem: make(chan struct{}, concurrency)}
+	return &Service{cfg: cfg, cache: cache, log: log, cooldown: map[string]time.Time{}, sem: make(chan struct{}, concurrency)}
 }
 
 func (s *Service) Apply(ctx context.Context, l domain.Listing) (domain.Listing, bool, error) {
@@ -58,7 +61,7 @@ func (s *Service) Apply(ctx context.Context, l domain.Listing) (domain.Listing, 
 		l.ExtractionStatus = "skipped"
 		return l, false, nil
 	}
-	if !s.cfg.Enabled || s.cfg.BaseURL == "" || s.cfg.APIKey == "" || len(s.cfg.Models) == 0 {
+	if !s.cfg.Enabled || s.cfg.BaseURL == "" || s.cfg.APIKey == "" || len(s.cfg.Models) == 0 && s.cfg.AutoModel == "" {
 		l.ExtractionStatus = "pending"
 		return l, false, nil
 	}
@@ -77,11 +80,11 @@ func (s *Service) Apply(ctx context.Context, l domain.Listing) (domain.Listing, 
 			return l, true, nil
 		}
 	}
-	models, discoveryErr := s.activeModels(ctx)
+	models, autoModel, discoveryErr := s.activeModels(ctx)
 	if discoveryErr != nil {
 		return failed(l, s.cfg.SchemaVersion), false, discoveryErr
 	}
-	if len(models) == 0 {
+	if len(models) == 0 && autoModel == "" {
 		return failed(l, s.cfg.SchemaVersion), false, fmt.Errorf("none of configured extraction models is available")
 	}
 	select {
@@ -91,7 +94,17 @@ func (s *Service) Apply(ctx context.Context, l domain.Listing) (domain.Listing, 
 		return failed(l, s.cfg.SchemaVersion), false, ctx.Err()
 	}
 	var last error
+	operationalOnly := true
 	for modelIndex, model := range models {
+		if until, cooling := s.modelCoolingDown(model); cooling {
+			last = fmt.Errorf("model %s is cooling down until %s", model, until.Format(time.RFC3339))
+			action := "defer"
+			if modelIndex+1 < len(models) || autoModel != "" && operationalOnly {
+				action = "fallback"
+			}
+			s.log.Info("LLM extraction model skipped", "facebook_post_id", l.FacebookPostID, "model", model, "error_class", "rate_limit", "retry_at", until.Format(time.RFC3339), "action", action)
+			continue
+		}
 		p := llm.New(llm.Config{Provider: "compatible", BaseURL: s.cfg.BaseURL, APIKey: s.cfg.APIKey, Model: model, Timeout: s.modelTimeout(model, modelIndex, len(models)), Concurrency: s.cfg.Concurrency, MaxTokens: 1400})
 		attempts := s.cfg.MaxAttempts
 		if attempts < 1 {
@@ -104,21 +117,25 @@ func (s *Service) Apply(ctx context.Context, l domain.Listing) (domain.Listing, 
 			}
 			s.log.Info("LLM extraction attempt", "facebook_post_id", l.FacebookPostID, "model", model, "model_index", modelIndex+1, "attempt", retry+1, "latency_ms", meta.Latency.Milliseconds(), "valid", err == nil, "fallback_reason", errorText(err), "input_tokens", meta.InputTokens, "output_tokens", meta.OutputTokens)
 			if err == nil {
-				entry := CacheEntry{Result: result, Model: model, LatencyMS: int(meta.Latency.Milliseconds()), InputTokens: meta.InputTokens, OutputTokens: meta.OutputTokens}
-				if s.cache != nil {
-					if e := s.cache.SaveEnrichment(ctx, hash, s.cfg.SchemaVersion, entry); e != nil {
-						s.log.Warn("save extraction cache", "error", e)
-					}
-				}
-				l = Merge(l, result)
-				success(&l, s.cfg.SchemaVersion, model)
-				return l, true, nil
+				return s.saveSuccess(ctx, l, hash, result, meta, model)
 			}
 			last = err
 			if ctx.Err() != nil {
 				return failed(l, s.cfg.SchemaVersion), false, ctx.Err()
 			}
+			if llm.IsRateLimit(err) {
+				until, retryAfter := s.setModelCooldown(model, err)
+				action := "defer"
+				if modelIndex+1 < len(models) || autoModel != "" && operationalOnly {
+					action = "fallback"
+				}
+				s.log.Warn("LLM extraction rate limited", "facebook_post_id", l.FacebookPostID, "model", model, "error_class", "rate_limit", "retry_after_ms", retryAfter.Milliseconds(), "retry_at", until.Format(time.RFC3339), "action", action)
+				break
+			}
 			if !llm.IsTransient(err) || retry+1 >= attempts {
+				if !llm.IsTransient(err) {
+					operationalOnly = false
+				}
 				break
 			}
 			base := s.cfg.RetryBase
@@ -135,7 +152,40 @@ func (s *Service) Apply(ctx context.Context, l domain.Listing) (domain.Listing, 
 			}
 		}
 	}
+	if autoModel != "" && operationalOnly {
+		if until, cooling := s.modelCoolingDown(autoModel); cooling {
+			last = fmt.Errorf("auto model %s is cooling down until %s", autoModel, until.Format(time.RFC3339))
+			s.log.Info("LLM auto router skipped", "facebook_post_id", l.FacebookPostID, "model", autoModel, "error_class", "rate_limit", "retry_at", until.Format(time.RFC3339), "action", "defer")
+		} else {
+			p := llm.New(llm.Config{Provider: "compatible", BaseURL: s.cfg.BaseURL, APIKey: s.cfg.APIKey, Model: autoModel, Timeout: s.modelTimeout(autoModel, len(models), len(models)+1), Concurrency: s.cfg.Concurrency, MaxTokens: 1400})
+			result, meta, err := p.EnrichDetailed(ctx, clean, l)
+			if err == nil {
+				err = ValidateAgainst(result, l)
+			}
+			s.log.Info("LLM extraction auto router attempt", "facebook_post_id", l.FacebookPostID, "model", autoModel, "attempt", 1, "latency_ms", meta.Latency.Milliseconds(), "valid", err == nil, "fallback_reason", errorText(err), "input_tokens", meta.InputTokens, "output_tokens", meta.OutputTokens)
+			if err == nil {
+				return s.saveSuccess(ctx, l, hash, result, meta, autoModel)
+			}
+			last = err
+			if llm.IsRateLimit(err) {
+				until, retryAfter := s.setModelCooldown(autoModel, err)
+				s.log.Warn("LLM extraction rate limited", "facebook_post_id", l.FacebookPostID, "model", autoModel, "error_class", "rate_limit", "retry_after_ms", retryAfter.Milliseconds(), "retry_at", until.Format(time.RFC3339), "action", "defer")
+			}
+		}
+	}
 	return failed(l, s.cfg.SchemaVersion), false, last
+}
+
+func (s *Service) saveSuccess(ctx context.Context, l domain.Listing, hash [32]byte, result domain.Enrichment, meta llm.CallMeta, model string) (domain.Listing, bool, error) {
+	entry := CacheEntry{Result: result, Model: model, LatencyMS: int(meta.Latency.Milliseconds()), InputTokens: meta.InputTokens, OutputTokens: meta.OutputTokens}
+	if s.cache != nil {
+		if err := s.cache.SaveEnrichment(ctx, hash, s.cfg.SchemaVersion, entry); err != nil {
+			s.log.Warn("save extraction cache", "error", err)
+		}
+	}
+	l = Merge(l, result)
+	success(&l, s.cfg.SchemaVersion, model)
+	return l, true, nil
 }
 
 func (s *Service) modelTimeout(model string, index, total int) time.Duration {
@@ -152,25 +202,31 @@ func (s *Service) modelTimeout(model string, index, total int) time.Duration {
 	return base
 }
 
-func (s *Service) activeModels(ctx context.Context) ([]string, error) {
+func (s *Service) activeModels(ctx context.Context) ([]string, string, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if len(s.models) > 0 {
-		return append([]string(nil), s.models...), nil
+	if s.discovered {
+		return append([]string(nil), s.models...), s.autoModel, nil
 	}
-	models, err := s.discover(ctx)
+	models, autoModel, err := s.discover(ctx)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
+	s.discovered = true
 	s.models = models
-	return append([]string(nil), models...), nil
+	s.autoModel = autoModel
+	return append([]string(nil), models...), autoModel, nil
 }
 
-func (s *Service) discover(ctx context.Context) ([]string, error) {
-	p := llm.New(llm.Config{Provider: "compatible", BaseURL: s.cfg.BaseURL, APIKey: s.cfg.APIKey, Model: s.cfg.Models[0], Timeout: s.cfg.Timeout, Concurrency: 1})
+func (s *Service) discover(ctx context.Context) ([]string, string, error) {
+	seedModel := s.cfg.AutoModel
+	if len(s.cfg.Models) > 0 {
+		seedModel = s.cfg.Models[0]
+	}
+	p := llm.New(llm.Config{Provider: "compatible", BaseURL: s.cfg.BaseURL, APIKey: s.cfg.APIKey, Model: seedModel, Timeout: s.cfg.Timeout, Concurrency: 1})
 	available, err := p.AvailableModels(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("discover extraction models: %w", err)
+		return nil, "", fmt.Errorf("discover extraction models: %w", err)
 	}
 	var out []string
 	for _, m := range s.cfg.Models {
@@ -178,8 +234,49 @@ func (s *Service) discover(ctx context.Context) ([]string, error) {
 			out = append(out, m)
 		}
 	}
-	s.log.Info("extraction model chain discovered", "configured", s.cfg.Models, "active", out)
-	return out, nil
+	autoModel := ""
+	if s.cfg.AutoModel != "" && slices.Contains(available, s.cfg.AutoModel) && !slices.Contains(out, s.cfg.AutoModel) {
+		autoModel = s.cfg.AutoModel
+	}
+	s.log.Info("extraction model chain discovered", "configured", s.cfg.Models, "active", out, "configured_auto_model", s.cfg.AutoModel, "active_auto_model", autoModel)
+	return out, autoModel, nil
+}
+
+func (s *Service) modelCoolingDown(model string) (time.Time, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	until, ok := s.cooldown[model]
+	if !ok {
+		return time.Time{}, false
+	}
+	if !until.After(time.Now()) {
+		delete(s.cooldown, model)
+		return time.Time{}, false
+	}
+	return until, true
+}
+
+func (s *Service) setModelCooldown(model string, err error) (time.Time, time.Duration) {
+	now := time.Now()
+	at, retryAfter, known := llm.RateLimitReset(err)
+	if at.IsZero() && retryAfter > 0 {
+		at = now.Add(retryAfter)
+	}
+	if !known || !at.After(now) {
+		retryAfter = 45 * time.Second
+		at = now.Add(retryAfter)
+	} else {
+		retryAfter = at.Sub(now)
+	}
+	s.mu.Lock()
+	if current := s.cooldown[model]; current.After(at) {
+		at = current
+		retryAfter = at.Sub(now)
+	} else {
+		s.cooldown[model] = at
+	}
+	s.mu.Unlock()
+	return at, retryAfter
 }
 func success(l *domain.Listing, version, model string) {
 	now := time.Now().UTC()
@@ -222,6 +319,9 @@ func ValidateAgainst(e domain.Enrichment, rules domain.Listing) error {
 	}
 	if e.AreaM2 != nil && (*e.AreaM2 < 8 || *e.AreaM2 > 1000) {
 		return fmt.Errorf("invalid area_m2")
+	}
+	if e.PropertyType != nil && *e.PropertyType != "apartment" && *e.PropertyType != "house" && *e.PropertyType != "room" && *e.PropertyType != "studio" {
+		return fmt.Errorf("invalid property_type")
 	}
 	if e.District == nil || !domain.IsCanonicalDistrict(*e.District) {
 		return fmt.Errorf("invalid district")

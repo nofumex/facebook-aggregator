@@ -7,8 +7,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -49,8 +51,10 @@ type CallMeta struct {
 	InputTokens, OutputTokens int
 }
 type HTTPError struct {
-	Status int
-	Body   string
+	Status     int
+	Body       string
+	RetryAfter time.Duration
+	RetryAt    time.Time
 }
 
 func (e *HTTPError) Error() string { return fmt.Sprintf("LLM HTTP %d: %s", e.Status, e.Body) }
@@ -67,6 +71,21 @@ func IsTransient(err error) bool {
 	}
 	var n net.Error
 	return errors.As(err, &n)
+}
+
+func IsRateLimit(err error) bool {
+	var h *HTTPError
+	return errors.As(err, &h) && h.Status == http.StatusTooManyRequests
+}
+
+// RateLimitReset returns provider rate-limit timing when it was supplied in
+// Retry-After or a compatible JSON retryAtMs field.
+func RateLimitReset(err error) (time.Time, time.Duration, bool) {
+	var h *HTTPError
+	if !errors.As(err, &h) || h.Status != http.StatusTooManyRequests {
+		return time.Time{}, 0, false
+	}
+	return h.RetryAt, h.RetryAfter, !h.RetryAt.IsZero() || h.RetryAfter > 0
 }
 
 type OpenAICompatible struct {
@@ -341,7 +360,10 @@ func normalizeEnrichmentJSON(raw []byte, compatibleJSONMode bool) ([]byte, error
 		}
 	}
 	if _, ok := object["is_rental_listing"]; !ok {
-		return nil, fmt.Errorf("invalid enrichment JSON: missing is_rental_listing")
+		if !compatibleJSONMode || !inferRentalListing(object) {
+			return nil, fmt.Errorf("invalid enrichment JSON: missing is_rental_listing")
+		}
+		object["is_rental_listing"] = json.RawMessage("true")
 	}
 	if !compatibleJSONMode {
 		for _, key := range keys {
@@ -376,6 +398,36 @@ func normalizeEnrichmentJSON(raw []byte, compatibleJSONMode bool) ([]byte, error
 		return nil, fmt.Errorf("invalid confidence: %w", err)
 	}
 	return json.Marshal(object)
+}
+
+// inferRentalListing is deliberately conservative. A monthly rent value must
+// be accompanied by another independent, canonical rental/property fact.
+// Location alone and provider metadata never qualify as rental evidence.
+func inferRentalListing(object map[string]json.RawMessage) bool {
+	if !hasJSONValue(object["rent_vnd"]) && !hasJSONValue(object["rent_max_vnd"]) {
+		return false
+	}
+	for _, key := range []string{"deposit_vnd", "property_type", "bedrooms", "rooms", "area_m2", "lease_months_min", "furnished"} {
+		if hasJSONValue(object[key]) {
+			return true
+		}
+	}
+	if raw := object["utilities"]; hasJSONValue(raw) {
+		var utilities map[string]json.RawMessage
+		if json.Unmarshal(raw, &utilities) == nil {
+			for _, key := range []string{"electricity_vnd_per_kwh", "water_vnd_per_person", "water_vnd_per_month", "wifi_vnd_per_month", "service_vnd_per_month", "parking_vnd_per_month"} {
+				if hasJSONValue(utilities[key]) {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+func hasJSONValue(raw json.RawMessage) bool {
+	trimmed := bytes.TrimSpace(raw)
+	return len(trimmed) > 0 && !bytes.Equal(trimmed, []byte("null"))
 }
 
 func normalizeNullableObject(raw json.RawMessage, keys []string, zero, dropUnknown bool) (json.RawMessage, error) {
@@ -436,7 +488,7 @@ func (p *OpenAICompatible) chat(ctx context.Context, body map[string]any) (strin
 		return "", usage{}, err
 	}
 	if resp.StatusCode/100 != 2 {
-		return "", usage{}, &HTTPError{Status: resp.StatusCode, Body: sanitize(string(raw))}
+		return "", usage{}, newHTTPError(resp.StatusCode, raw, resp.Header, time.Now())
 	}
 	var envelope struct {
 		Choices []struct {
@@ -453,6 +505,81 @@ func (p *OpenAICompatible) chat(ctx context.Context, body map[string]any) (strin
 		return "", usage{}, fmt.Errorf("invalid LLM response")
 	}
 	return envelope.Choices[0].Message.Content, usage{envelope.Usage.PromptTokens, envelope.Usage.CompletionTokens}, nil
+}
+
+func newHTTPError(status int, raw []byte, header http.Header, now time.Time) *HTTPError {
+	err := &HTTPError{Status: status, Body: sanitize(string(raw))}
+	if status != http.StatusTooManyRequests {
+		return err
+	}
+	if value := strings.TrimSpace(header.Get("Retry-After")); value != "" {
+		if seconds, parseErr := strconv.ParseInt(value, 10, 64); parseErr == nil && seconds >= 0 {
+			err.RetryAfter = time.Duration(seconds) * time.Second
+			err.RetryAt = now.Add(err.RetryAfter)
+		} else if at, parseErr := http.ParseTime(value); parseErr == nil {
+			err.RetryAt = at
+			if at.After(now) {
+				err.RetryAfter = at.Sub(now)
+			}
+		}
+	}
+	if at, ok := retryAtFromJSON(raw, now); ok && (err.RetryAt.IsZero() || at.After(err.RetryAt)) {
+		err.RetryAt = at
+		if at.After(now) {
+			err.RetryAfter = at.Sub(now)
+		} else {
+			err.RetryAfter = 0
+		}
+	}
+	return err
+}
+
+func retryAtFromJSON(raw []byte, now time.Time) (time.Time, bool) {
+	var value any
+	if json.Unmarshal(raw, &value) != nil {
+		return time.Time{}, false
+	}
+	var find func(any) (float64, bool)
+	find = func(v any) (float64, bool) {
+		switch x := v.(type) {
+		case map[string]any:
+			for key, child := range x {
+				if strings.EqualFold(key, "retryAtMs") {
+					switch n := child.(type) {
+					case float64:
+						return n, true
+					case string:
+						parsed, err := strconv.ParseFloat(n, 64)
+						return parsed, err == nil
+					}
+					return 0, false
+				}
+				if n, ok := find(child); ok {
+					return n, true
+				}
+			}
+		case []any:
+			for _, child := range x {
+				if n, ok := find(child); ok {
+					return n, true
+				}
+			}
+		}
+		return 0, false
+	}
+	milliseconds, ok := find(value)
+	if !ok || milliseconds <= 0 || milliseconds > float64(math.MaxInt64) {
+		return time.Time{}, false
+	}
+	// Providers use retryAtMs both for epoch milliseconds and, occasionally,
+	// for a millisecond delay. Values below a plausible epoch are delays.
+	if milliseconds < float64(now.UnixMilli()/2) {
+		if milliseconds > float64(math.MaxInt64/int64(time.Millisecond)) {
+			return time.Time{}, false
+		}
+		return now.Add(time.Duration(milliseconds) * time.Millisecond), true
+	}
+	return time.UnixMilli(int64(milliseconds)), true
 }
 
 func enrichmentSchema() map[string]any {

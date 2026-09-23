@@ -3,11 +3,13 @@ package llm
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/egori/facebook-aggregator/internal/domain"
 )
@@ -138,3 +140,68 @@ func TestCompatibleRejectsImpossibleType(t *testing.T) {
 		t.Fatal("invalid type accepted")
 	}
 }
+
+func TestCompatibleInfersMissingRentalFlagConservatively(t *testing.T) {
+	tests := []struct {
+		name      string
+		content   string
+		wantValue *bool
+		wantError bool
+	}{
+		{name: "rent and property", content: `{"rent_vnd":6500000,"property_type":"apartment"}`, wantValue: boolPtr(true)},
+		{name: "rent only", content: `{"rent_vnd":6500000}`, wantError: true},
+		{name: "location only", content: `{"district":"Son Tra","location_original":"My Khe"}`, wantError: true},
+		{name: "explicit true", content: `{"is_rental_listing":true}`, wantValue: boolPtr(true)},
+		{name: "explicit false", content: `{"is_rental_listing":false}`, wantValue: boolPtr(false)},
+		{name: "wrong type", content: `{"is_rental_listing":"yes","rent_vnd":6500000,"property_type":"apartment"}`, wantError: true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				_ = json.NewEncoder(w).Encode(map[string]any{"choices": []any{map[string]any{"message": map[string]any{"content": tc.content}}}})
+			}))
+			defer srv.Close()
+			got, err := New(Config{Provider: "compatible", BaseURL: srv.URL, APIKey: "x", Model: "m"}).Enrich(context.Background(), "rental source", domain.Listing{})
+			if tc.wantError {
+				if err == nil {
+					t.Fatalf("expected failure, got %+v", got)
+				}
+				return
+			}
+			if err != nil || got.IsRental == nil || *got.IsRental != *tc.wantValue {
+				t.Fatalf("is_rental=%v err=%v", got.IsRental, err)
+			}
+		})
+	}
+}
+
+func TestStrictModeStillRequiresRentalFlag(t *testing.T) {
+	canonical := map[string]any{}
+	for _, key := range enrichmentKeys() {
+		if key != "is_rental_listing" {
+			canonical[key] = nil
+		}
+	}
+	raw, _ := json.Marshal(canonical)
+	if _, err := normalizeEnrichmentJSON(raw, false); err == nil || !strings.Contains(err.Error(), "missing is_rental_listing") {
+		t.Fatalf("strict mode accepted missing rental flag: %v", err)
+	}
+}
+
+func TestRateLimitTimingParsing(t *testing.T) {
+	now := time.Date(2026, 9, 23, 12, 0, 0, 0, time.UTC)
+	retryAt := now.Add(15 * time.Second)
+	raw := []byte(fmt.Sprintf(`{"error":{"retryAtMs":%d}}`, retryAt.UnixMilli()))
+	err := newHTTPError(http.StatusTooManyRequests, raw, http.Header{"Retry-After": []string{"5"}}, now)
+	at, after, ok := RateLimitReset(err)
+	if !ok || !at.Equal(retryAt) || after != 15*time.Second {
+		t.Fatalf("at=%v after=%v ok=%v", at, after, ok)
+	}
+	relative := newHTTPError(http.StatusTooManyRequests, []byte(`{"retryAtMs":"28800000"}`), nil, now)
+	at, after, ok = RateLimitReset(relative)
+	if !ok || !at.Equal(now.Add(8*time.Hour)) || after != 8*time.Hour {
+		t.Fatalf("relative at=%v after=%v ok=%v", at, after, ok)
+	}
+}
+
+func boolPtr(value bool) *bool { return &value }

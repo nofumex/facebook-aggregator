@@ -91,7 +91,7 @@ func TestCascadeFallbackAndFirstValidStops(t *testing.T) {
 }
 
 func TestTransientHTTPRetriesSameModel(t *testing.T) {
-	for _, status := range []int{http.StatusTooManyRequests, http.StatusInternalServerError} {
+	for _, status := range []int{http.StatusRequestTimeout, http.StatusInternalServerError} {
 		t.Run(http.StatusText(status), func(t *testing.T) {
 			calls := 0
 			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -113,6 +113,53 @@ func TestTransientHTTPRetriesSameModel(t *testing.T) {
 				t.Fatalf("calls=%d ok=%v err=%v got=%+v", calls, ok, err, got)
 			}
 		})
+	}
+}
+
+func TestRateLimitImmediatelyFallsBackWithoutSameModelRetry(t *testing.T) {
+	calls := map[string]int{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/models" {
+			_ = json.NewEncoder(w).Encode(map[string]any{"data": []any{map[string]any{"id": "limited"}, map[string]any{"id": "strong"}}})
+			return
+		}
+		var req struct {
+			Model string `json:"model"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		calls[req.Model]++
+		if req.Model == "limited" {
+			w.Header().Set("Retry-After", "15")
+			w.WriteHeader(http.StatusTooManyRequests)
+			_, _ = w.Write([]byte(`{"error":{"message":"rate limited"}}`))
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"choices": []any{map[string]any{"message": map[string]any{"content": validJSON(4_500_000)}}}})
+	}))
+	defer srv.Close()
+	cfg := config.LLMExtraction{Enabled: true, BaseURL: srv.URL, APIKey: "x", Timeout: time.Second, Concurrency: 1, SchemaVersion: "v1", Models: []string{"limited", "strong"}, RetryBase: time.Millisecond, MaxAttempts: 4}
+	_, ok, err := New(cfg, nil, nil).Apply(context.Background(), domain.Listing{OriginalText: "studio 4tr5", Confidence: domain.Confidence{}, RawValues: map[string]any{}})
+	if err != nil || !ok || calls["limited"] != 1 || calls["strong"] != 1 {
+		t.Fatalf("calls=%v ok=%v err=%v", calls, ok, err)
+	}
+}
+
+func TestLastModelRateLimitDefersWithoutRapidRetries(t *testing.T) {
+	calls := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/models" {
+			_ = json.NewEncoder(w).Encode(map[string]any{"data": []any{map[string]any{"id": "limited"}}})
+			return
+		}
+		calls++
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = w.Write([]byte(`{"error":{"retryAtMs":9999999999999}}`))
+	}))
+	defer srv.Close()
+	cfg := config.LLMExtraction{Enabled: true, BaseURL: srv.URL, APIKey: "x", Timeout: time.Second, Concurrency: 1, SchemaVersion: "v1", Models: []string{"limited"}, RetryBase: time.Millisecond, MaxAttempts: 4}
+	_, ok, err := New(cfg, nil, nil).Apply(context.Background(), domain.Listing{OriginalText: "studio 4tr5", Confidence: domain.Confidence{}, RawValues: map[string]any{}})
+	if err == nil || ok || calls != 1 {
+		t.Fatalf("calls=%d ok=%v err=%v", calls, ok, err)
 	}
 }
 
@@ -166,6 +213,139 @@ func TestInvalidEnumFallsBackWithoutSameModelRetry(t *testing.T) {
 	_, ok, err := New(cfg, nil, nil).Apply(context.Background(), domain.Listing{OriginalText: "studio", Confidence: domain.Confidence{}, RawValues: map[string]any{}})
 	if err != nil || !ok || calls["light"] != 1 || calls["strong"] != 1 {
 		t.Fatalf("calls=%v ok=%v err=%v", calls, ok, err)
+	}
+}
+
+func TestConfiguredAutoRouterFallback(t *testing.T) {
+	tests := []struct {
+		name          string
+		availableAuto bool
+		explicitBody  string
+		wantAutoCalls int
+		wantSuccess   bool
+	}{
+		{name: "available after provider failure", availableAuto: true, wantAutoCalls: 1, wantSuccess: true},
+		{name: "unavailable", availableAuto: false, wantAutoCalls: 0, wantSuccess: false},
+		{name: "not used after semantic validation failure", availableAuto: true, explicitBody: `{"choices":[{"message":{"content":"{\"is_rental_listing\":true,\"district\":\"invalid\"}"}}]}`, wantAutoCalls: 0, wantSuccess: false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			calls := map[string]int{}
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path == "/models" {
+					models := []any{map[string]any{"id": "explicit"}}
+					if tc.availableAuto {
+						models = append(models, map[string]any{"id": "auto:balanced"})
+					}
+					_ = json.NewEncoder(w).Encode(map[string]any{"data": models})
+					return
+				}
+				var req struct {
+					Model string `json:"model"`
+				}
+				_ = json.NewDecoder(r.Body).Decode(&req)
+				calls[req.Model]++
+				if req.Model == "auto:balanced" {
+					_ = json.NewEncoder(w).Encode(map[string]any{"choices": []any{map[string]any{"message": map[string]any{"content": validJSON(4_500_000)}}}})
+					return
+				}
+				if tc.explicitBody != "" {
+					w.Header().Set("Content-Type", "application/json")
+					_, _ = w.Write([]byte(tc.explicitBody))
+					return
+				}
+				http.Error(w, "unavailable", http.StatusServiceUnavailable)
+			}))
+			defer srv.Close()
+			cfg := config.LLMExtraction{Enabled: true, BaseURL: srv.URL, APIKey: "x", Timeout: time.Second, Concurrency: 1, SchemaVersion: "v1", Models: []string{"explicit"}, AutoModel: "auto:balanced", RetryBase: time.Millisecond, MaxAttempts: 1}
+			_, ok, err := New(cfg, nil, nil).Apply(context.Background(), domain.Listing{OriginalText: "studio 4tr5", Confidence: domain.Confidence{}, RawValues: map[string]any{}})
+			if ok != tc.wantSuccess || (err == nil) != tc.wantSuccess || calls["auto:balanced"] != tc.wantAutoCalls {
+				t.Fatalf("calls=%v ok=%v err=%v", calls, ok, err)
+			}
+		})
+	}
+}
+
+func TestAutoModelInExplicitListRunsAsOrdinaryModel(t *testing.T) {
+	calls := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/models" {
+			_ = json.NewEncoder(w).Encode(map[string]any{"data": []any{map[string]any{"id": "auto:balanced"}}})
+			return
+		}
+		calls++
+		_ = json.NewEncoder(w).Encode(map[string]any{"choices": []any{map[string]any{"message": map[string]any{"content": validJSON(4_500_000)}}}})
+	}))
+	defer srv.Close()
+	cfg := config.LLMExtraction{Enabled: true, BaseURL: srv.URL, APIKey: "x", Timeout: time.Second, Concurrency: 1, SchemaVersion: "v1", Models: []string{"auto:balanced"}, AutoModel: "auto:balanced"}
+	got, ok, err := New(cfg, nil, nil).Apply(context.Background(), domain.Listing{OriginalText: "studio 4tr5", Confidence: domain.Confidence{}, RawValues: map[string]any{}})
+	if err != nil || !ok || calls != 1 || got.LLMModel != "auto:balanced" {
+		t.Fatalf("calls=%d model=%q ok=%v err=%v", calls, got.LLMModel, ok, err)
+	}
+}
+
+func TestAutoRouterIsCalledAtMostOnce(t *testing.T) {
+	calls := map[string]int{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/models" {
+			_ = json.NewEncoder(w).Encode(map[string]any{"data": []any{map[string]any{"id": "explicit"}, map[string]any{"id": "auto:balanced"}}})
+			return
+		}
+		var req struct {
+			Model string `json:"model"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		calls[req.Model]++
+		http.Error(w, "unavailable", http.StatusServiceUnavailable)
+	}))
+	defer srv.Close()
+	cfg := config.LLMExtraction{Enabled: true, BaseURL: srv.URL, APIKey: "x", Timeout: time.Second, Concurrency: 1, SchemaVersion: "v1", Models: []string{"explicit"}, AutoModel: "auto:balanced", RetryBase: time.Millisecond, MaxAttempts: 4}
+	_, _, _ = New(cfg, nil, nil).Apply(context.Background(), domain.Listing{OriginalText: "studio 4tr5", Confidence: domain.Confidence{}, RawValues: map[string]any{}})
+	if calls["explicit"] != 4 || calls["auto:balanced"] != 1 {
+		t.Fatalf("calls=%v", calls)
+	}
+}
+
+func TestSharedModelCooldownSkipsConcurrentWorker(t *testing.T) {
+	requestStarted := make(chan struct{})
+	releaseResponse := make(chan struct{})
+	var once sync.Once
+	calls := 0
+	var callsMu sync.Mutex
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/models" {
+			_ = json.NewEncoder(w).Encode(map[string]any{"data": []any{map[string]any{"id": "limited"}}})
+			return
+		}
+		callsMu.Lock()
+		calls++
+		callsMu.Unlock()
+		once.Do(func() { close(requestStarted) })
+		<-releaseResponse
+		w.Header().Set("Retry-After", "60")
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = w.Write([]byte(`{"error":{"message":"rate limited"}}`))
+	}))
+	defer srv.Close()
+	cfg := config.LLMExtraction{Enabled: true, BaseURL: srv.URL, APIKey: "x", Timeout: time.Second, Concurrency: 1, SchemaVersion: "v1", Models: []string{"limited"}, RetryBase: time.Millisecond, MaxAttempts: 4}
+	svc := New(cfg, nil, nil)
+	done := make(chan struct{}, 2)
+	go func() {
+		_, _, _ = svc.Apply(context.Background(), domain.Listing{OriginalText: "listing one", Confidence: domain.Confidence{}, RawValues: map[string]any{}})
+		done <- struct{}{}
+	}()
+	<-requestStarted
+	go func() {
+		_, _, _ = svc.Apply(context.Background(), domain.Listing{OriginalText: "listing two", Confidence: domain.Confidence{}, RawValues: map[string]any{}})
+		done <- struct{}{}
+	}()
+	close(releaseResponse)
+	<-done
+	<-done
+	callsMu.Lock()
+	defer callsMu.Unlock()
+	if calls != 1 {
+		t.Fatalf("rate-limited model called %d times", calls)
 	}
 }
 
