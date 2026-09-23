@@ -27,3 +27,25 @@ func TestSparseDataIsCautious(t *testing.T) {
 		t.Fatalf("score %.1f confidence %.2f", s, c)
 	}
 }
+
+func TestStrongThreeDayOldListingBeatsWeakFreshListing(t *testing.T) {
+	e, now := New(), time.Now()
+	strong := domain.Listing{RentMin: i64(5_000_000), Bedrooms: i(1), AreaM2: f(45), District: "Son Tra", PropertyType: "apartment", Furnished: "full", PublishedAt: now.Add(-72 * time.Hour), Confidence: domain.Confidence{"price": .95, "bedrooms": .9, "area_m2": .9, "district": .9, "property_type": .9, "furnished": .9}, Amenities: map[string]bool{"balcony": true}, Utilities: map[string]any{}}
+	weak := domain.Listing{RentMin: i64(6_800_000), Bedrooms: i(1), AreaM2: f(45), District: "Son Tra", PropertyType: "apartment", PublishedAt: now.Add(-20 * time.Minute), Confidence: domain.Confidence{"price": .8}, Amenities: map[string]bool{}, Utilities: map[string]any{}}
+	b := Benchmarks{MedianRent: 7_000_000, MedianPriceM2: 155_000, SimilarCount: 40}
+	aScore, _ := e.Score(strong, b, now)
+	bScore, _ := e.Score(weak, b, now)
+	if aScore <= bScore {
+		t.Fatalf("older strong %.1f should beat fresh weak %.1f", aScore, bScore)
+	}
+}
+
+func TestScoreChangesWhenComparablesChange(t *testing.T) {
+	e, now := New(), time.Now()
+	l := domain.Listing{RentMin: i64(5_000_000), Bedrooms: i(1), AreaM2: f(40), District: "Son Tra", PropertyType: "apartment", PublishedAt: now, Confidence: domain.Confidence{"price": .9}, Amenities: map[string]bool{}, Utilities: map[string]any{}}
+	before, _ := e.Score(l, Benchmarks{MedianRent: 5_100_000, MedianPriceM2: 127_500, SimilarCount: 8}, now)
+	after, _ := e.Score(l, Benchmarks{MedianRent: 7_000_000, MedianPriceM2: 175_000, SimilarCount: 40}, now)
+	if after <= before {
+		t.Fatalf("reranking did not react to new comparables: %.1f -> %.1f", before, after)
+	}
+}

@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/egori/facebook-aggregator/internal/domain"
+	"github.com/egori/facebook-aggregator/internal/enrichment"
 	fbadapter "github.com/egori/facebook-aggregator/internal/facebook"
 	"github.com/egori/facebook-aggregator/internal/parser"
 	"github.com/egori/facebook-aggregator/internal/ranking"
@@ -20,6 +21,7 @@ type Service struct {
 	fb          fbadapter.Adapter
 	parser      *parser.Parser
 	rank        ranking.Engine
+	extractor   *enrichment.Service
 	log         *slog.Logger
 	concurrency int
 	trigger     chan int64
@@ -27,11 +29,11 @@ type Service struct {
 	running     map[int64]bool
 }
 
-func New(store *storage.Store, fb fbadapter.Adapter, p *parser.Parser, r ranking.Engine, log *slog.Logger, concurrency int) *Service {
+func New(store *storage.Store, fb fbadapter.Adapter, p *parser.Parser, r ranking.Engine, extractor *enrichment.Service, log *slog.Logger, concurrency int) *Service {
 	if concurrency < 1 {
 		concurrency = 1
 	}
-	return &Service{store: store, fb: fb, parser: p, rank: r, log: log, concurrency: concurrency, trigger: make(chan int64, 100), running: map[int64]bool{}}
+	return &Service{store: store, fb: fb, parser: p, rank: r, extractor: extractor, log: log, concurrency: concurrency, trigger: make(chan int64, 100), running: map[int64]bool{}}
 }
 func (s *Service) Trigger(groupID int64) bool {
 	select {
@@ -126,6 +128,13 @@ func (s *Service) SyncGroup(ctx context.Context, g domain.Group) (domain.GroupSy
 			continue
 		}
 		l := s.parser.Parse(post, g.ID, g.Name)
+		if s.extractor != nil {
+			enriched, _, enrichErr := s.extractor.Apply(ctx, l)
+			l = enriched
+			if enrichErr != nil {
+				s.log.Warn("LLM extraction issue; continuing rule pipeline", "post_id", post.ID, "error", enrichErr)
+			}
+		}
 		b, bErr := s.store.Benchmarks(ctx, l)
 		if bErr != nil && !errors.Is(bErr, context.Canceled) {
 			s.log.Debug("benchmarks unavailable", "error", bErr)

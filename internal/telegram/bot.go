@@ -126,7 +126,7 @@ func (b *Bot) callback(ctx context.Context, q *CallbackQuery) {
 		b.mu.Unlock()
 		b.runSearch(ctx, q.Message.Chat.ID, q.Message.MessageID, q.From.ID, f, "🔎 Подходящие варианты")
 	case "page":
-		b.showPage(ctx, q.Message.Chat.ID, q.Message.MessageID, q.From.ID, parts)
+		b.showPage(ctx, q.Message.Chat.ID, q.Message.MessageID, q.From.ID, len(q.Message.Photo) > 0, parts)
 	case "save":
 		b.listAction(ctx, q, true, parts)
 	case "hide":
@@ -135,10 +135,6 @@ func (b *Bot) callback(ctx context.Context, q *CallbackQuery) {
 		b.showDetails(ctx, q, parts)
 	case "photos":
 		b.openPhotos(ctx, q, parts)
-	case "photo":
-		b.turnPhoto(ctx, q, parts)
-	case "closephoto":
-		_ = b.api.Delete(ctx, q.Message.Chat.ID, q.Message.MessageID)
 	case "collections":
 		b.showCollections(ctx, q)
 	case "col":
@@ -227,7 +223,7 @@ func (b *Bot) showFilters(ctx context.Context, q *CallbackQuery) {
 	f := b.filters[q.From.ID]
 	b.mu.Unlock()
 	text := "<b>🔎 Поиск и фильтры</b>\n\n" + filterSummary(f) + "\n\nМожно также просто написать: <code>2 спальни son tra до 6 млн</code>"
-	k := Markup{[][]Button{{cb("до 5 млн", "filter:max:5000000"), cb("до 7 млн", "filter:max:7000000"), cb("до 10 млн", "filter:max:10000000")}, {cb("Studio", "filter:beds:0"), cb("1 спальня", "filter:beds:1"), cb("2 спальни", "filter:beds:2")}, {cb("Sơn Trà", "filter:district:Sơn Trà"), cb("Ngũ Hành Sơn", "filter:district:Ngũ Hành Sơn")}, {cb("Квартира", "filter:type:apartment"), cb("Дом", "filter:type:house"), cb("Комната", "filter:type:room")}, {cb("от 30 м²", "filter:area:30"), cb("от 50 м²", "filter:area:50"), cb("С мебелью", "filter:furnished:full")}, {cb("🌊 У моря", "filter:beach:1"), cb("🌍 Для иностранцев", "filter:foreign:1")}, {cb("Сначала выгодные", "filter:sort:score"), cb("Сначала новые", "filter:sort:new")}, {cb("✅ Показать", "find"), cb("♻️ Сбросить", "filter:reset")}, {cb("← Меню", "menu")}}}
+	k := Markup{[][]Button{{cb("до 5 млн", "filter:max:5000000"), cb("до 7 млн", "filter:max:7000000"), cb("до 10 млн", "filter:max:10000000")}, {cb("Studio", "filter:beds:0"), cb("1 спальня", "filter:beds:1"), cb("2 спальни", "filter:beds:2")}, {cb("Sơn Trà", "filter:district:Son Tra"), cb("Ngũ Hành Sơn", "filter:district:Ngu Hanh Son")}, {cb("Квартира", "filter:type:apartment"), cb("Дом", "filter:type:house"), cb("Комната", "filter:type:room")}, {cb("от 30 м²", "filter:area:30"), cb("от 50 м²", "filter:area:50"), cb("С мебелью", "filter:furnished:full")}, {cb("🌊 У моря", "filter:beach:1"), cb("🌍 Для иностранцев", "filter:foreign:1")}, {cb("Сначала выгодные", "filter:sort:score"), cb("Сначала новые", "filter:sort:new")}, {cb("✅ Показать", "find"), cb("♻️ Сбросить", "filter:reset")}, {cb("← Меню", "menu")}}}
 	b.editOrSend(ctx, q.Message.Chat.ID, q.Message.MessageID, text, k)
 }
 func (b *Bot) applyFilter(ctx context.Context, q *CallbackQuery, p []string) {
@@ -306,9 +302,9 @@ func (b *Bot) cacheAndShow(ctx context.Context, chat int64, msg int, user int64,
 		}
 	}
 	b.mu.Unlock()
-	b.renderCard(ctx, chat, msg, token, 0)
+	b.renderCard(ctx, chat, msg, token, 0, false)
 }
-func (b *Bot) showPage(ctx context.Context, chat int64, msg int, user int64, p []string) {
+func (b *Bot) showPage(ctx context.Context, chat int64, msg int, user int64, currentPhoto bool, p []string) {
 	if len(p) < 3 {
 		return
 	}
@@ -341,9 +337,9 @@ func (b *Bot) showPage(ctx context.Context, chat int64, msg int, user int64, p [
 	if idx >= len(c.items) {
 		idx = len(c.items) - 1
 	}
-	b.renderCard(ctx, chat, msg, p[1], idx)
+	b.renderCard(ctx, chat, msg, p[1], idx, currentPhoto)
 }
-func (b *Bot) renderCard(ctx context.Context, chat int64, msg int, token string, idx int) {
+func (b *Bot) renderCard(ctx context.Context, chat int64, msg int, token string, idx int, currentPhoto bool) {
 	b.mu.Lock()
 	c := b.pages[token]
 	b.mu.Unlock()
@@ -365,11 +361,40 @@ func (b *Bot) renderCard(ctx context.Context, chat int64, msg int, token string,
 		}
 	}
 	rows := [][]Button{{urlb("Открыть Facebook", l.FacebookURL)}}
-	if n := len(photoURLs(l.MediaURLs)); n > 0 {
-		rows = append(rows, []Button{cb(fmt.Sprintf("📷 Фото · %d", n), fmt.Sprintf("photos:%d", l.ID))})
+	photos := photoURLs(l.MediaURLs)
+	if n := len(photos); n > 0 {
+		rows = append(rows, []Button{cb(fmt.Sprintf("📷 Все фото · %d", n), fmt.Sprintf("photos:%d", l.ID))})
 	}
 	rows = append(rows, []Button{cb("❤️ Сохранить", fmt.Sprintf("save:%d", l.ID)), cb("🙈 Скрыть", fmt.Sprintf("hide:%d", l.ID)), cb("Подробнее", fmt.Sprintf("detail:%d", l.ID))}, []Button{cb("◀️", fmt.Sprintf("page:%s:%d", token, prev)), cb(fmt.Sprintf("%d/%d", idx+1, c.total), "noop"), cb("▶️", fmt.Sprintf("page:%s:%d", token, next))}, []Button{cb("← Меню", "menu")})
 	k := Markup{rows}
+	if len(photos) > 0 {
+		if currentPhoto && msg > 0 {
+			if err := b.api.EditPhoto(ctx, chat, msg, photos[0], text, k); err == nil {
+				return
+			}
+			_ = b.api.Delete(ctx, chat, msg)
+		} else if msg > 0 {
+			_ = b.api.Delete(ctx, chat, msg)
+		}
+		if _, err := b.api.SendPhoto(ctx, chat, photos[0], text, k); err == nil {
+			return
+		} else if b.log != nil {
+			b.log.Warn("photo card unavailable; rendering text card", "listing_id", l.ID, "error", err)
+		}
+		_, err := b.api.Send(ctx, chat, text, k)
+		if err != nil && b.log != nil {
+			b.log.Warn("telegram text card fallback", "error", err)
+		}
+		return
+	}
+	if currentPhoto && msg > 0 {
+		_ = b.api.Delete(ctx, chat, msg)
+		_, err := b.api.Send(ctx, chat, text, k)
+		if err != nil && b.log != nil {
+			b.log.Warn("telegram text card", "error", err)
+		}
+		return
+	}
 	b.editOrSend(ctx, chat, msg, text, k)
 }
 func card(l domain.Listing, vndToRUB float64) string {
@@ -388,12 +413,14 @@ func card(l domain.Listing, vndToRUB float64) string {
 	if len(specs) > 0 {
 		lines = append(lines, "🏠 <b>"+strings.Join(specs, " · ")+"</b>")
 	}
-	if l.District != "" || l.Address != "" {
-		loc := l.District
-		if l.Address != "" {
-			loc += map[bool]string{true: " · ", false: ""}[loc != ""] + l.Address
+	if l.District != "" || l.Ward != "" || l.Address != "" {
+		locations := make([]string, 0, 3)
+		for _, value := range []string{l.District, l.Ward, l.Address} {
+			if value != "" {
+				locations = append(locations, value)
+			}
 		}
-		lines = append(lines, "📍 "+html.EscapeString(loc))
+		lines = append(lines, "📍 "+html.EscapeString(strings.Join(locations, " · ")))
 	}
 	if l.RentMin != nil {
 		price := money(*l.RentMin)
@@ -417,7 +444,7 @@ func card(l domain.Listing, vndToRUB float64) string {
 		lines = append(lines, "⚡ Электричество и вода: гос. тариф")
 	}
 	if l.Furnished != "" {
-		lines = append(lines, "🪑 "+map[string]string{"full": "Полная мебель", "basic": "Базовая мебель", "none": "Без мебели"}[l.Furnished])
+		lines = append(lines, "🪑 "+map[string]string{"full": "Полная мебель", "partial": "Частичная мебель", "basic": "Базовая мебель", "none": "Без мебели"}[l.Furnished])
 	}
 	lines = append(lines, fmt.Sprintf("\n⭐ Deal score: <b>%.0f/100</b>", l.DealScore), "🕒 "+ago(l.PublishedAt))
 	return strings.Join(lines, "\n")
@@ -466,50 +493,44 @@ func (b *Bot) openPhotos(ctx context.Context, q *CallbackQuery, p []string) {
 		_ = b.api.Answer(ctx, q.ID, "В этом объявлении фотографии недоступны")
 		return
 	}
-	_, err = b.api.SendPhoto(ctx, q.Message.Chat.ID, photos[0], photoCaption(l, 0, len(photos)), photoKeyboard(l, 0, len(photos)))
+	err = sendAlbumsResilient(ctx, b.api, q.Message.Chat.ID, photos)
 	if err != nil && b.log != nil {
-		b.log.Warn("telegram photo", "error", err)
+		b.log.Warn("some listing photos were unavailable", "listing_id", l.ID, "error", err)
 	}
 }
 
-func (b *Bot) turnPhoto(ctx context.Context, q *CallbackQuery, p []string) {
-	if len(p) < 3 {
-		return
+func sendAlbumsResilient(ctx context.Context, api *Client, chat int64, photos []string) error {
+	var failures []string
+	var sendChunk func([]string)
+	sendChunk = func(chunk []string) {
+		if len(chunk) == 0 {
+			return
+		}
+		media := make([]InputMediaPhoto, len(chunk))
+		for i, photo := range chunk {
+			media[i] = InputMediaPhoto{Type: "photo", Media: photo}
+		}
+		if _, err := api.SendMediaGroup(ctx, chat, media); err == nil {
+			return
+		} else if len(chunk) == 1 {
+			failures = append(failures, chunk[0])
+			return
+		}
+		mid := len(chunk) / 2
+		sendChunk(chunk[:mid])
+		sendChunk(chunk[mid:])
 	}
-	id, _ := strconv.ParseInt(p[1], 10, 64)
-	idx, _ := strconv.Atoi(p[2])
-	l, err := b.store.Listing(ctx, id)
-	if err != nil {
-		return
+	for start := 0; start < len(photos); start += 10 {
+		end := start + 10
+		if end > len(photos) {
+			end = len(photos)
+		}
+		sendChunk(photos[start:end])
 	}
-	photos := photoURLs(l.MediaURLs)
-	if len(photos) == 0 {
-		return
+	if len(failures) > 0 {
+		return fmt.Errorf("%d of %d photos unavailable", len(failures), len(photos))
 	}
-	if idx < 0 {
-		idx = 0
-	}
-	if idx >= len(photos) {
-		idx = len(photos) - 1
-	}
-	if err = b.api.EditPhoto(ctx, q.Message.Chat.ID, q.Message.MessageID, photos[idx], photoCaption(l, idx, len(photos)), photoKeyboard(l, idx, len(photos))); err != nil && b.log != nil {
-		b.log.Warn("telegram photo pagination", "error", err)
-	}
-}
-
-func photoCaption(l domain.Listing, idx, total int) string {
-	return fmt.Sprintf("<b>Фото %d/%d</b> · объявление #%d", idx+1, total, l.ID)
-}
-
-func photoKeyboard(l domain.Listing, idx, total int) Markup {
-	prev, next := idx-1, idx+1
-	if prev < 0 {
-		prev = 0
-	}
-	if next >= total {
-		next = total - 1
-	}
-	return Markup{[][]Button{{cb("◀️", fmt.Sprintf("photo:%d:%d", l.ID, prev)), cb(fmt.Sprintf("%d/%d", idx+1, total), "noop"), cb("▶️", fmt.Sprintf("photo:%d:%d", l.ID, next))}, {urlb("Открыть пост", l.FacebookURL), cb("✕ Закрыть", "closephoto")}}}
+	return nil
 }
 
 func photoURLs(items []string) []string {
@@ -702,7 +723,7 @@ func (b *Bot) checkGroup(ctx context.Context, q *CallbackQuery, p []string) {
 func (b *Bot) showLLM(ctx context.Context, q *CallbackQuery) {
 	enabled := false
 	_ = b.store.Setting(ctx, "llm.enabled", &enabled)
-	text := fmt.Sprintf("<b>LLM</b>\nСтатус: %s\n\nLLM не участвует в обязательном парсинге. При сбое подборки автоматически используют deal score.", map[bool]string{true: "включён", false: "выключен"}[enabled])
+	text := fmt.Sprintf("<b>LLM</b>\nСтатус: %s\n\nПри включении LLM дополняет только плохо распарсенные объявления до расчёта рейтинга и затем выполняет финальный отбор подборки. При сбое продолжает работать rule-based pipeline.", map[bool]string{true: "включён", false: "выключен"}[enabled])
 	k := Markup{[][]Button{{cb(map[bool]string{true: "Выключить", false: "Включить"}[enabled], "llmset:enabled")}, {cb("Provider", "llmset:provider"), cb("Base URL", "llmset:base_url")}, {cb("Model", "llmset:model"), cb("Timeout", "llmset:timeout")}, {cb("Concurrency", "llmset:concurrency"), cb("API key", "llmset:api_key")}, {cb("Проверить подключение", "llmcheck")}, {cb("← Админка", "admin")}}}
 	b.editOrSend(ctx, q.Message.Chat.ID, q.Message.MessageID, text, k)
 }
@@ -843,6 +864,10 @@ func (b *Bot) editOrSend(ctx context.Context, chat int64, msg int, text string, 
 	}
 	if e != nil && strings.Contains(e.Error(), "message is not modified") {
 		return
+	}
+	if e != nil && msg > 0 && (strings.Contains(e.Error(), "there is no text") || strings.Contains(e.Error(), "message can't be edited")) {
+		_ = b.api.Delete(ctx, chat, msg)
+		_, e = b.api.Send(ctx, chat, text, k)
 	}
 	if e != nil {
 		b.log.Warn("telegram render", "error", e)

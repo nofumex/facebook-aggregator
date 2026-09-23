@@ -5,7 +5,9 @@ import (
 	"fmt"
 	"github.com/egori/facebook-aggregator/internal/domain"
 	"github.com/egori/facebook-aggregator/internal/llm"
+	"github.com/egori/facebook-aggregator/internal/ranking"
 	"github.com/egori/facebook-aggregator/internal/storage"
+	"log/slog"
 	"strings"
 	"sync"
 	"time"
@@ -24,10 +26,18 @@ type Service struct {
 	provider func(context.Context) llm.Provider
 	mu       sync.Mutex
 	cache    map[cacheKey]cached
+	rank     ranking.Engine
+	log      *slog.Logger
 }
 
 func New(s *storage.Store, p func(context.Context) llm.Provider) *Service {
-	return &Service{store: s, provider: p, cache: map[cacheKey]cached{}}
+	return &Service{store: s, provider: p, cache: map[cacheKey]cached{}, rank: ranking.New(), log: slog.Default()}
+}
+func NewWithRanking(s *storage.Store, p func(context.Context) llm.Provider, r ranking.Engine, log *slog.Logger) *Service {
+	if log == nil {
+		log = slog.Default()
+	}
+	return &Service{store: s, provider: p, cache: map[cacheKey]cached{}, rank: r, log: log}
 }
 func (s *Service) Get(ctx context.Context, user int64, days int) ([]domain.CollectionItem, error) {
 	if days != 1 && days != 7 && days != 30 {
@@ -41,7 +51,11 @@ func (s *Service) Get(ctx context.Context, user int64, days int) ([]domain.Colle
 		return c.items, nil
 	}
 	after := time.Now().Add(-time.Duration(days) * 24 * time.Hour)
-	page, e := s.store.Search(ctx, user, domain.SearchFilter{FreshAfter: &after, Sort: "score", Limit: 50})
+	reranked, e := s.store.RerankPeriod(ctx, after, s.rank, 500)
+	if e != nil {
+		return nil, e
+	}
+	page, e := s.store.Search(ctx, user, domain.SearchFilter{FreshAfter: &after, Sort: "score", Limit: 500})
 	if e != nil {
 		return nil, e
 	}
@@ -71,6 +85,26 @@ func (s *Service) Get(ctx context.Context, user int64, days int) ([]domain.Colle
 	s.mu.Lock()
 	s.cache[key] = cached{items, time.Now().Add(10 * time.Minute)}
 	s.mu.Unlock()
+	normalized := 0
+	for _, x := range page.Items {
+		if x.ExtractionStatus == "success" {
+			normalized++
+		}
+	}
+	attrs := []any{"days", days, "total_period", page.Total, "normalized", normalized, "quality_passed", len(candidates), "reranked", reranked, "shortlist", min(len(candidates), 40), "selected", len(items)}
+	if len(items) > 0 {
+		oldest, newest := items[0].PublishedAt, items[0].PublishedAt
+		for _, x := range items {
+			if x.PublishedAt.Before(oldest) {
+				oldest = x.PublishedAt
+			}
+			if x.PublishedAt.After(newest) {
+				newest = x.PublishedAt
+			}
+		}
+		attrs = append(attrs, "oldest_selected", oldest, "newest_selected", newest)
+	}
+	s.log.Info("collection built", attrs...)
 	return items, nil
 }
 func Title(days int) string {

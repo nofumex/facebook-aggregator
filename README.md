@@ -2,7 +2,7 @@
 
 Production-oriented Telegram aggregator for rental posts from Facebook Groups. It polls Facebook over HTTP using an adapted fork of [`teslashibe/facebook-go`](https://github.com/teslashibe/facebook-go), keeps the original post, normalizes Vietnamese/English listing text, ranks offers locally, and exposes search, filters, favorites and curated collections through inline Telegram UI.
 
-The core pipeline works without an LLM. An LLM is optional and only reorders/explains a small shortlist for `🔥 Подборки`; every LLM error falls back to the local `deal_score`.
+The core pipeline works without an LLM. When extraction is enabled, every new unique cleaned `content_hash` is semantically normalized once per extraction schema version before ranking. The optional final collection curator is a separate configuration and never changes normalized facts or scores. Every LLM, discovery, validation, or cache error preserves the rule-based pipeline and stores a retryable extraction status.
 
 ## Architecture
 
@@ -11,7 +11,9 @@ Facebook cookies → replaceable Facebook Adapter → per-group scheduler
                                             ↓
                          PostgreSQL transaction + post_id dedup
                                             ↓
-                   rule parser → local ranking → indexed listings
+        clean text → rule parser → LLM extraction cascade → validation/merge
+                                            ↓
+                    normalized PostgreSQL → deterministic ranking
                                             ↓
                 Telegram inline UI / cached result-page snapshots
                                             ↓ optional
@@ -24,6 +26,7 @@ Important boundaries:
 - `third_party/facebook-go` is a pinned MIT-licensed fork. It fixes chronological group feeds, streamed Relay payload merging, current nested story parsing, media discovery, and group-feed pagination. Replacing it only requires another `Adapter` implementation.
 - Telegram handlers only orchestrate UI. Parsing, ranking, sync, collections and persistence are separate packages.
 - PostgreSQL owns deduplication (`posts.facebook_post_id UNIQUE`), durable sync state and all user data.
+- Extraction cache identity is `(authoritative content_hash, schema_version)`; only the model input is cleaned. Search, rendering, ranking and collections never call the extractor.
 
 ## Quick start with Docker Compose
 
@@ -64,6 +67,32 @@ go run ./cmd/bot
 
 `fbcheck` prints only group/post identifiers, timestamps and byte/media counts; it does not print cookies or post text. `-shape` is a value-redacted protocol diagnostic for Facebook schema changes.
 
+## Semantic extraction
+
+Extraction and final curation have independent configuration. Configure extraction with:
+
+```dotenv
+LLM_EXTRACTION_ENABLED=true
+LLM_EXTRACTION_BASE_URL=http://159.194.241.69:5173/v1
+LLM_EXTRACTION_API_KEY=...
+LLM_EXTRACTION_TIMEOUT=25s
+LLM_EXTRACTION_CONCURRENCY=2
+LLM_EXTRACTION_SCHEMA_VERSION=rental-v1
+LLM_EXTRACTION_MODELS=llama-3.2-1b-instruct,ministral-3b,llama-3.2-3b,ministral-3-8b,gpt-oss-20b,gemma-sea-lion-v4-27b,gemini-3.5-flash-lite
+```
+
+At process start-on-first-use the configured order is intersected with IDs returned by authenticated `GET /models`; unavailable IDs are never called. Each model gets at most two attempts with bounded backoff. Invalid JSON, schema/range violations, contradictions and missing obvious facts advance to the next model. Structured logs include post ID, model, attempt, latency, validation/fallback reason and token usage. A valid first result stops the cascade.
+
+The extractor receives cleaned `original_text` plus minimal Facebook metadata and rule-parser hints. It returns facts only: rent/deposit/utilities/surcharge are distinct, district is a canonical enum, unknown values remain null, and it cannot set `deal_score`. Typed facts live in `listings`; structured utilities, amenities and restrictions remain JSONB. `llm_enrichments` stores the normalized response and call metadata by content hash and schema version.
+
+After deploying a new schema version, backfill existing rows without stopping the bot:
+
+```bash
+go run ./cmd/extract-backfill -batch 100
+```
+
+The command selects only missing/failed/outdated versions, observes extraction concurrency, saves every batch, and recalculates scores. It is safe to restart. When the API is unavailable, deterministic data is retained and `extraction_status=failed` (or `pending` when extraction is disabled/misconfigured) remains eligible for a later run.
+
 ## Facebook cookies
 
 Use a dedicated Facebook account with membership only in the groups the service needs. Do not give the bot a Facebook password.
@@ -88,7 +117,7 @@ The main UI uses edited messages and inline keyboards:
 - `🔥 Подборки` — today, 7 days, 30 days;
 - `❤️ Избранное`, hide and details actions;
 - listing cards show the live VND equivalent in RUB using the cached official Bank of Russia daily rate;
-- Facebook photos are stored with the post and opened as an in-chat `◀️/▶️` gallery;
+- the first Facebook photo is the listing card media; `📷 Все фото` sends albums in batches of ten while skipping expired CDN images;
 - `🛠 Админка` — visible only to `TELEGRAM_ADMIN_IDS`.
 
 Search result snapshots are cached for five minutes, so `◀️/▶️` pagination only edits the existing Telegram message and does not rerun the database query. Callback queries are acknowledged before work begins; DB, Facebook and LLM tasks execute outside the polling loop.
@@ -103,9 +132,22 @@ The rule parser retains `original_text`, raw money mentions and per-field confid
 
 District, property type, bedrooms/studio, area, furnishing, beach distance, amenities, pets, foreigner acceptance, temporary residence and lease terms are extracted best-effort. Add regression examples to `internal/parser/parser_test.go` whenever a new real-world syntax appears.
 
-`deal_score` is modular and favors value for money against the median of comparable district/type/bedroom listings over 180 days. It also considers price per m², freshness, completeness, beach, furniture, amenities, utilities, foreigner friendliness, deposit and sample size. Sparse data shrinks the result toward neutral instead of strongly penalizing missing fields. Weights live in `internal/ranking` and can be moved to application settings without changing the scoring interface.
+Comparable medians use up to 90 days, the same district/type, bedrooms within one, and area within ±30%. The exact score is clamped to 0..100:
+
+```text
+deal_score = 50
+  + 26*clamp((median_rent-rent)/(0.35*median_rent), -1, 1)
+  + 12*clamp((median_price_m2-price_m2)/(0.35*median_price_m2), -1, 1)
+  + 3*area_preference + 3*bedroom_preference + 3*district_preference
+  + 4*furnishing + 4*beach + 4*amenities + 2*utilities
+  + 3*(2*exp(-age_days/30)-1) + 5*(2*score_confidence-1)
+```
+
+Preferences default to neutral and do not claim that a district is inherently better. `RankingConfig` centralizes every coefficient and is optionally loaded from `application_settings['ranking.config']`. `score_confidence = 0.55*weighted_field_coverage + 0.25*mean_extraction_confidence + 0.20*min(log(1+comparables)/log(41),1)`. Field coverage weights are price .25, district .15, type .12, bedrooms .12, area .16, furnishing .05 and detailed location .05.
 
 Collections have a stricter admission gate than search: reliable parsed rent, at least two core property facts, `deal_score >= 62`, and score confidence `>= 0.65`. The quota is never padded with incomplete listings. When LLM mode is enabled, only admitted candidates are sent together with their source text and confidence data; the LLM may return fewer candidates or none.
+
+Every unique post is extracted before ranking when extraction is enabled. Merge never replaces known data with null; high-confidence rule scalars win ordinary conflicts, while validated LLM semantics resolve explicitly marked old/current-price ambiguity and complex structured fields. Collections rerank as many as 500 rows across the complete selected 1/7/30-day period before the strict quality gate, so freshness is only a small component rather than an early cutoff.
 
 ## Incremental polling behavior
 

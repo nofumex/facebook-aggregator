@@ -22,6 +22,10 @@ type Message struct {
 	From      User   `json:"from"`
 	Chat      Chat   `json:"chat"`
 	Text      string `json:"text"`
+	Caption   string `json:"caption"`
+	Photo     []struct {
+		FileID string `json:"file_id"`
+	} `json:"photo"`
 }
 type CallbackQuery struct {
 	ID      string  `json:"id"`
@@ -41,6 +45,12 @@ type Button struct {
 }
 type Markup struct {
 	InlineKeyboard [][]Button `json:"inline_keyboard"`
+}
+type InputMediaPhoto struct {
+	Type      string `json:"type"`
+	Media     string `json:"media"`
+	Caption   string `json:"caption,omitempty"`
+	ParseMode string `json:"parse_mode,omitempty"`
 }
 type Client struct {
 	base string
@@ -99,6 +109,21 @@ func (c *Client) SendPhoto(ctx context.Context, chat int64, photo, caption strin
 func (c *Client) EditPhoto(ctx context.Context, chat int64, msg int, photo, caption string, k Markup) error {
 	media := map[string]any{"type": "photo", "media": photo, "caption": caption, "parse_mode": "HTML"}
 	return c.call(ctx, "editMessageMedia", map[string]any{"chat_id": chat, "message_id": msg, "media": media, "reply_markup": k}, nil)
+}
+func (c *Client) SendMediaGroup(ctx context.Context, chat int64, media []InputMediaPhoto) ([]Message, error) {
+	if len(media) < 1 || len(media) > 10 {
+		return nil, fmt.Errorf("sendMediaGroup requires 1..10 items")
+	}
+	if len(media) == 1 {
+		message, err := c.SendPhoto(ctx, chat, media[0].Media, media[0].Caption, Markup{})
+		if err != nil {
+			return nil, err
+		}
+		return []Message{message}, nil
+	}
+	var out []Message
+	err := c.call(ctx, "sendMediaGroup", map[string]any{"chat_id": chat, "media": media}, &out)
+	return out, err
 }
 func (c *Client) Answer(ctx context.Context, id, text string) error {
 	return c.call(ctx, "answerCallbackQuery", map[string]any{"callback_query_id": id, "text": text}, nil)

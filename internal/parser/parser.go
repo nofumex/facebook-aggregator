@@ -24,12 +24,20 @@ var (
 	leaseRE         = regexp.MustCompile(`(?i)(?:hợp đồng|lease|thuê)\s*(?:từ|min(?:imum)?|:)?\s*(\d{1,2})\s*(?:tháng|months?)`)
 	phoneRE         = regexp.MustCompile(`\b(?:\+?84|0)[\s.-]?(?:\d[\s.-]?){8,10}\b`)
 	searchBedRU     = regexp.MustCompile(`(?i)([1-9])\s*спальн(?:я|и|ь|ей)?`)
+	markdownLinkRE  = regexp.MustCompile(`\[([^\]]+)\]\(https?://[^)]+\)`)
 )
 
 type moneyHit struct {
 	value      int64
 	raw        string
 	start, end int
+}
+
+// CleanForExtraction removes Facebook's technical markdown links while
+// preserving their human-visible label, numbers, phones and location text.
+func CleanForExtraction(s string) string {
+	s = markdownLinkRE.ReplaceAllString(s, "$1")
+	return normalize(s)
 }
 
 func (p *Parser) Parse(post domain.FacebookPost, groupID int64, groupName string) domain.Listing {
@@ -244,7 +252,7 @@ func district(s string) string {
 	districts := []struct {
 		name  string
 		words []string
-	}{{"Sơn Trà", []string{"sơn trà", "son tra"}}, {"Ngũ Hành Sơn", []string{"ngũ hành sơn", "ngu hanh son", "mỹ an", "my an", "an thượng", "an thuong"}}, {"Hải Châu", []string{"hải châu", "hai chau"}}, {"Thanh Khê", []string{"thanh khê", "thanh khe"}}, {"Liên Chiểu", []string{"liên chiểu", "lien chieu"}}, {"Cẩm Lệ", []string{"cẩm lệ", "cam le"}}, {"Hòa Vang", []string{"hòa vang", "hoa vang"}}}
+	}{{"Son Tra", []string{"sơn trà", "son tra"}}, {"Ngu Hanh Son", []string{"ngũ hành sơn", "ngu hanh son", "mỹ an", "my an", "an thượng", "an thuong", "khu fpt", "fpt complex"}}, {"Hai Chau", []string{"hải châu", "hai chau"}}, {"Thanh Khe", []string{"thanh khê", "thanh khe"}}, {"Lien Chieu", []string{"liên chiểu", "lien chieu"}}, {"Cam Le", []string{"cẩm lệ", "cam le"}}, {"Hoa Vang", []string{"hòa vang", "hoa vang"}}}
 	for _, d := range districts {
 		if containsAny(s, d.words...) {
 			return d.name
@@ -257,7 +265,7 @@ func furnishing(s string) string {
 	case containsAny(s, "full nội thất", "đầy đủ nội thất", "fully furnished", "full furniture"):
 		return "full"
 	case containsAny(s, "cơ bản", "basic furniture", "partly furnished"):
-		return "basic"
+		return "partial"
 	case containsAny(s, "không nội thất", "unfurnished", "no furniture"):
 		return "none"
 	}

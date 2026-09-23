@@ -1,9 +1,10 @@
 package ranking
 
 import (
-	"github.com/egori/facebook-aggregator/internal/domain"
 	"math"
 	"time"
+
+	"github.com/egori/facebook-aggregator/internal/domain"
 )
 
 type Benchmarks struct {
@@ -11,83 +12,132 @@ type Benchmarks struct {
 	SimilarCount              int
 	HistoricalTrend           float64
 }
-type Weights struct{ Value, PriceM2, Freshness, Completeness, Amenities, Beach, Furnishing, Foreigner, Utilities, Deposit, Rarity float64 }
-type Engine struct{ W Weights }
-
-func New() Engine {
-	return Engine{Weights{Value: 32, PriceM2: 14, Freshness: 12, Completeness: 10, Amenities: 8, Beach: 6, Furnishing: 5, Foreigner: 4, Utilities: 4, Deposit: 3, Rarity: 2}}
+type Weights struct{ RelativeRent, PriceM2, Area, Bedrooms, District, Furnishing, Beach, Amenities, Utilities, Freshness, Evidence float64 }
+type RankingConfig struct {
+	Base                          float64
+	Weights                       Weights
+	District, Bedroom, AreaBucket map[string]float64
+	Furnishing                    map[string]float64
 }
+type Engine struct{ Config RankingConfig }
 
+func DefaultConfig() RankingConfig {
+	return RankingConfig{
+		Base:     50,
+		Weights:  Weights{RelativeRent: 26, PriceM2: 12, Area: 3, Bedrooms: 3, District: 3, Furnishing: 4, Beach: 4, Amenities: 4, Utilities: 2, Freshness: 3, Evidence: 5},
+		District: map[string]float64{}, Bedroom: map[string]float64{}, AreaBucket: map[string]float64{},
+		Furnishing: map[string]float64{"full": .5, "partial": .2, "none": 0},
+	}
+}
+func New() Engine                          { return Engine{Config: DefaultConfig()} }
+func NewWithConfig(c RankingConfig) Engine { return Engine{Config: c} }
+
+// Score is deterministic. Relative price components are centered at the
+// comparable median; preferences are separate editable multipliers.
 func (e Engine) Score(l domain.Listing, b Benchmarks, now time.Time) (float64, float64) {
-	score := 50.0
-	evidence := 0.0
+	c := e.Config
+	if c.Base == 0 {
+		c = DefaultConfig()
+	}
+	w := c.Weights
+	score := c.Base
 	if l.RentMin != nil && b.MedianRent > 0 {
-		ratio := float64(*l.RentMin) / b.MedianRent
-		score += clamp((1-ratio)*e.W.Value, -e.W.Value*.55, e.W.Value)
-		evidence += .24
+		score += w.RelativeRent * clamp((b.MedianRent-float64(*l.RentMin))/(b.MedianRent*.35), -1, 1)
 	}
 	if l.RentMin != nil && l.AreaM2 != nil && *l.AreaM2 > 0 && b.MedianPriceM2 > 0 {
 		ppm := float64(*l.RentMin) / *l.AreaM2
-		score += clamp((1-ppm/b.MedianPriceM2)*e.W.PriceM2, -e.W.PriceM2*.5, e.W.PriceM2)
-		evidence += .18
+		score += w.PriceM2 * clamp((b.MedianPriceM2-ppm)/(b.MedianPriceM2*.35), -1, 1)
+	}
+	score += w.District * c.District[l.District]
+	score += w.Bedrooms * c.Bedroom[bedBucket(l.Bedrooms)]
+	score += w.Area * c.AreaBucket[areaBucket(l.AreaM2)]
+	score += w.Furnishing * c.Furnishing[l.Furnished]
+	if l.NearBeach != nil && *l.NearBeach {
+		v := .5
+		if l.BeachDistanceM != nil {
+			v = clamp(1-float64(*l.BeachDistanceM)/3000, .1, 1)
+		}
+		score += w.Beach * v
+	}
+	amenities := 0
+	for _, v := range l.Amenities {
+		if v {
+			amenities++
+		}
+	}
+	score += w.Amenities * math.Min(float64(amenities)/6, 1)
+	if len(l.Utilities) > 0 {
+		score += w.Utilities * .2
+	}
+	if gov, ok := l.Utilities["government_rate"].(bool); ok && gov {
+		score += w.Utilities * .3
 	}
 	age := now.Sub(l.PublishedAt)
 	if age < 0 {
 		age = 0
 	}
-	score += e.W.Freshness * math.Exp(-age.Hours()/(24*7))
-	evidence += .08
-	fields := 0
-	for _, ok := range []bool{l.RentMin != nil, l.Bedrooms != nil, l.AreaM2 != nil, l.District != "", l.PropertyType != "", l.Furnished != "", len(l.MediaURLs) > 0} {
-		if ok {
-			fields++
+	score += w.Freshness * (2*math.Exp(-age.Hours()/(24*30)) - 1)
+	confidence := ScoreConfidence(l, b.SimilarCount)
+	score += w.Evidence * (2*confidence - 1)
+	return round1(clamp(score, 0, 100)), math.Round(confidence*100) / 100
+}
+
+// ScoreConfidence = 0.55*weighted field coverage + 0.25*mean known-field
+// extraction confidence + 0.20*log-scaled comparable sample quality.
+func ScoreConfidence(l domain.Listing, sample int) float64 {
+	type f struct {
+		known  bool
+		key    string
+		weight float64
+	}
+	fields := []f{{l.RentMin != nil, "price", .25}, {l.District != "" && l.District != "Unknown", "district", .15}, {l.PropertyType != "", "property_type", .12}, {l.Bedrooms != nil, "bedrooms", .12}, {l.AreaM2 != nil, "area_m2", .16}, {l.Furnished != "", "furnished", .05}, {l.LocationOriginal != "" || l.Ward != "" || l.Street != "", "location_original", .05}}
+	coverage, total, quality, n := 0.0, 0.0, 0.0, 0.0
+	for _, x := range fields {
+		total += x.weight
+		if x.known {
+			coverage += x.weight
+			c := l.Confidence[x.key]
+			if c == 0 && x.key == "location_original" {
+				c = l.Confidence["district"]
+			}
+			quality += c
+			n++
 		}
 	}
-	score += e.W.Completeness * (float64(fields)/7 - .45)
-	evidence += float64(fields) / 7 * .16
-	amenityCount := 0
-	for _, v := range l.Amenities {
-		if v {
-			amenityCount++
-		}
+	if total > 0 {
+		coverage /= total
 	}
-	score += math.Min(e.W.Amenities, float64(amenityCount)*1.35)
-	if l.NearBeach != nil && *l.NearBeach {
-		bonus := e.W.Beach
-		if l.BeachDistanceM != nil {
-			bonus *= clamp(1-float64(*l.BeachDistanceM)/3000, .25, 1)
-		}
-		score += bonus
-		evidence += .05
+	if n > 0 {
+		quality /= n
 	}
-	if l.Furnished == "full" {
-		score += e.W.Furnishing
-	} else if l.Furnished == "basic" {
-		score += e.W.Furnishing * .45
+	sampleQ := math.Min(math.Log1p(float64(sample))/math.Log1p(40), 1)
+	return clamp(.55*coverage+.25*quality+.20*sampleQ, 0, 1)
+}
+func bedBucket(v *int) string {
+	if v == nil {
+		return "unknown"
 	}
-	if l.ForeignersAccepted != nil && *l.ForeignersAccepted {
-		score += e.W.Foreigner
-		evidence += .03
+	if *v >= 3 {
+		return "3+"
 	}
-	if gov, ok := l.Utilities["government_rate"].(bool); ok && gov {
-		score += e.W.Utilities
-		evidence += .03
+	return []string{"studio", "1", "2"}[*v]
+}
+func areaBucket(v *float64) string {
+	if v == nil {
+		return "unknown"
 	}
-	if l.DepositAmount != nil && l.RentMin != nil && *l.RentMin > 0 {
-		months := float64(*l.DepositAmount) / float64(*l.RentMin)
-		score += clamp((2-months)*e.W.Deposit, -e.W.Deposit, e.W.Deposit)
+	switch {
+	case *v < 25:
+		return "<25"
+	case *v < 35:
+		return "25-35"
+	case *v < 50:
+		return "35-50"
+	case *v < 70:
+		return "50-70"
+	default:
+		return "70+"
 	}
-	if b.SimilarCount >= 8 {
-		evidence += .18
-		if b.SimilarCount < 25 {
-			score += e.W.Rarity * .5
-		}
-	}
-	// With sparse comparables, shrink toward a neutral score instead of
-	// pretending an unusually cheap incomplete post is certainly a bargain.
-	confidence := clamp(evidence, .15, 1)
-	score = 50 + (score-50)*(.45+.55*confidence)
-	return math.Round(clamp(score, 0, 100)*10) / 10, math.Round(confidence*100) / 100
 }
 func clamp(v, lo, hi float64) float64 {
 	if v < lo {
@@ -98,3 +148,4 @@ func clamp(v, lo, hi float64) float64 {
 	}
 	return v
 }
+func round1(v float64) float64 { return math.Round(v*10) / 10 }

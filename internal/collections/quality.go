@@ -26,6 +26,9 @@ func Eligible(items []domain.Listing) []domain.Listing {
 }
 
 func IsEligible(l domain.Listing) bool {
+	if l.IsRental != nil && !*l.IsRental {
+		return false
+	}
 	if l.RentMin == nil || *l.RentMin < 1_000_000 || *l.RentMin > 200_000_000 {
 		return false
 	}

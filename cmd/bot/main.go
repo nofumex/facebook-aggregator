@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"github.com/egori/facebook-aggregator/internal/collections"
 	"github.com/egori/facebook-aggregator/internal/config"
+	"github.com/egori/facebook-aggregator/internal/enrichment"
 	fb "github.com/egori/facebook-aggregator/internal/facebook"
 	"github.com/egori/facebook-aggregator/internal/llm"
 	"github.com/egori/facebook-aggregator/internal/parser"
@@ -63,15 +64,20 @@ func main() {
 	} else {
 		log.Warn("SETTINGS_ENCRYPTION_KEY missing; secret updates in Telegram admin are disabled")
 	}
-	syncService := syncer.New(store, adapter, parser.New(), ranking.New(), log, cfg.WorkerConcurrency)
 	api := tg.NewClient(cfg.TelegramToken)
 	var bot *tg.Bot
-	collectionService := collections.New(store, func(c context.Context) llm.Provider {
+	provider := func(c context.Context) llm.Provider {
 		if bot == nil {
 			return llm.Disabled{}
 		}
 		return bot.Provider(c)
-	})
+	}
+	extractor := enrichment.New(cfg.Extraction, store, log)
+	rankEngine := ranking.NewWithConfig(store.RankingConfig(ctx))
+	syncService := syncer.New(store, adapter, parser.New(), rankEngine, extractor, log, cfg.WorkerConcurrency)
+	collectionService := collections.NewWithRanking(store, func(c context.Context) llm.Provider {
+		return provider(c)
+	}, rankEngine, log)
 	bot = tg.NewBot(api, store, syncService, adapter, collectionService, cfg.AdminIDs, cipher, log, cfg.DefaultPoll)
 	server := healthServer(cfg.HTTPAddr, store)
 	go func() {

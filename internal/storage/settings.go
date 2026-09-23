@@ -4,9 +4,16 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"github.com/egori/facebook-aggregator/internal/ranking"
 	"github.com/egori/facebook-aggregator/internal/secrets"
 	"github.com/jackc/pgx/v5"
 )
+
+func (s *Store) RankingConfig(ctx context.Context) ranking.RankingConfig {
+	cfg := ranking.DefaultConfig()
+	_ = s.Setting(ctx, "ranking.config", &cfg)
+	return cfg
+}
 
 func (s *Store) SetSetting(ctx context.Context, key string, value any) error {
 	b, e := json.Marshal(value)

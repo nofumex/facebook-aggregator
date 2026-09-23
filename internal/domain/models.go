@@ -39,6 +39,36 @@ type FacebookPost struct {
 
 type Confidence map[string]float64
 
+// Enrichment is the nullable, evidence-bound structure returned by the LLM.
+// Pointer fields distinguish an explicit false/zero from an unknown value.
+type Enrichment struct {
+	IsRental           *bool          `json:"is_rental_listing"`
+	RentMinVND         *int64         `json:"rent_vnd"`
+	RentMaxVND         *int64         `json:"rent_max_vnd"`
+	Bedrooms           *int           `json:"bedrooms"`
+	Rooms              *int           `json:"rooms"`
+	PropertyType       *string        `json:"property_type"`
+	AreaM2             *float64       `json:"area_m2"`
+	District           *string        `json:"district"`
+	LocationOriginal   *string        `json:"location_original"`
+	Ward               *string        `json:"ward"`
+	Street             *string        `json:"street"`
+	Address            *string        `json:"address"`
+	Building           *string        `json:"building"`
+	Furnished          *string        `json:"furnished"`
+	NearBeach          *bool          `json:"near_beach"`
+	BeachDistanceM     *int           `json:"beach_distance_m"`
+	DepositVND         *int64         `json:"deposit_vnd"`
+	Utilities          map[string]any `json:"utilities"`
+	Amenities          map[string]any `json:"amenities"`
+	Restrictions       map[string]any `json:"restrictions"`
+	ForeignersAccepted *bool          `json:"foreigners_allowed"`
+	ForeignerSurcharge *int64         `json:"foreigner_surcharge_vnd"`
+	PetsAllowed        *bool          `json:"pets_allowed"`
+	LeaseMonths        *int           `json:"lease_months_min"`
+	Confidence         Confidence     `json:"confidence"`
+}
+
 type Listing struct {
 	ID                       int64
 	PostID                   int64
@@ -56,12 +86,17 @@ type Listing struct {
 	EstimatedMonthlyTotalMin *int64
 	EstimatedMonthlyTotalMax *int64
 	Currency                 string
+	IsRental                 *bool
 	Bedrooms                 *int
+	Rooms                    *int
 	AreaM2                   *float64
 	PropertyType             string
 	District                 string
+	Ward                     string
+	LocationOriginal         string
 	Street                   string
 	Address                  string
+	Building                 string
 	NearBeach                *bool
 	BeachDistanceM           *int
 	Furnished                string
@@ -72,11 +107,16 @@ type Listing struct {
 	LeaseMonths              *int
 	DepositAmount            *int64
 	Utilities                map[string]any
+	Restrictions             map[string]any
 	RawValues                map[string]any
 	Confidence               Confidence
 	DealScore                float64
 	ScoreConfidence          float64
 	MediaURLs                []string
+	ExtractionVersion        string
+	ExtractionStatus         string
+	LLMExtractedAt           *time.Time
+	LLMModel                 string
 }
 
 type SearchFilter struct {

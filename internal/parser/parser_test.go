@@ -21,7 +21,7 @@ func TestVietnameseListing(t *testing.T) {
 	if l.AreaM2 == nil || *l.AreaM2 != 50 {
 		t.Fatal("area")
 	}
-	if l.District != "Sơn Trà" {
+	if l.District != "Son Tra" {
 		t.Fatal(l.District)
 	}
 	if l.BeachDistanceM == nil || *l.BeachDistanceM != 500 {
@@ -62,13 +62,21 @@ func TestFeeNotRent(t *testing.T) {
 }
 func TestAmbiguousStillSaved(t *testing.T) {
 	l := parse(t, "Nice apartment in My An. Inbox for price")
-	if l.OriginalText == "" || l.District != "Ngũ Hành Sơn" {
+	if l.OriginalText == "" || l.District != "Ngu Hanh Son" {
 		t.Fatalf("%+v", l)
 	}
 }
 func TestParseNaturalSearch(t *testing.T) {
 	f := ParseSearch("2 спальни son tra до 6 млн")
-	if f.Bedrooms == nil || *f.Bedrooms != 2 || f.District != "Sơn Trà" || f.RentMax == nil || *f.RentMax != 6_000_000 || f.Query != "" {
+	if f.Bedrooms == nil || *f.Bedrooms != 2 || f.District != "Son Tra" || f.RentMax == nil || *f.RentMax != 6_000_000 || f.Query != "" {
 		t.Fatalf("%+v", f)
+	}
+}
+
+func TestCleanForExtractionPreservesVisibleFacts(t *testing.T) {
+	in := "[🏠](https://static.xx.fbcdn.net/icon.png) Studio 4TR5 [📍](https://facebook.com/x) Khu FPT +84901234567"
+	want := "🏠 Studio 4TR5 📍 Khu FPT +84901234567"
+	if got := CleanForExtraction(in); got != want {
+		t.Fatalf("got %q want %q", got, want)
 	}
 }
