@@ -56,6 +56,95 @@ func TestCompatiblePartialObjectNormalizesCanonicalSchema(t *testing.T) {
 	}
 }
 
+func TestCompatibleRequestContainsCanonicalTemplate(t *testing.T) {
+	var request struct {
+		Messages []struct {
+			Role    string `json:"role"`
+			Content string `json:"content"`
+		} `json:"messages"`
+		ResponseFormat map[string]any `json:"response_format"`
+	}
+	response, _ := json.Marshal(canonicalEnrichmentTemplate())
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Fatal(err)
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"choices": []any{map[string]any{"message": map[string]any{"content": string(response)}}}})
+	}))
+	defer srv.Close()
+	got, err := New(Config{Provider: "compatible", BaseURL: srv.URL, APIKey: "x", Model: "auto"}).Enrich(context.Background(), "rental source", domain.Listing{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.IsRental == nil || *got.IsRental || request.ResponseFormat["type"] != "json_object" {
+		t.Fatalf("got=%+v response_format=%v", got, request.ResponseFormat)
+	}
+	if len(request.Messages) == 0 {
+		t.Fatal("missing messages")
+	}
+	systemPrompt := request.Messages[0].Content
+	for _, phrase := range []string{"ALWAYS include \"is_rental_listing\"", "MUST be boolean true or false", "must never be omitted", "never invent extra keys", "Use exactly the field names"} {
+		if !strings.Contains(systemPrompt, phrase) {
+			t.Fatalf("compatible prompt missing %q", phrase)
+		}
+	}
+	for _, key := range enrichmentKeys() {
+		if !strings.Contains(systemPrompt, `"`+key+`"`) {
+			t.Fatalf("compatible prompt missing canonical key %q", key)
+		}
+	}
+	canonicalTemplate := canonicalEnrichmentTemplate()
+	for _, group := range []string{"utilities", "amenities", "restrictions", "confidence"} {
+		for key := range canonicalTemplate[group].(map[string]any) {
+			if !strings.Contains(systemPrompt, `"`+key+`"`) {
+				t.Fatalf("compatible prompt missing %s canonical key %q", group, key)
+			}
+		}
+	}
+}
+
+func TestMissingRentalFlagReturnsOnlyResponseKeyMetadata(t *testing.T) {
+	content := `{"rent_vnd":6500000,"district":"Son Tra","group_name":"metadata"}`
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"choices": []any{map[string]any{"message": map[string]any{"content": content}}}})
+	}))
+	defer srv.Close()
+	_, meta, err := New(Config{Provider: "compatible", BaseURL: srv.URL, APIKey: "x", Model: "auto"}).EnrichDetailed(context.Background(), "secret post text", domain.Listing{})
+	if err == nil || strings.Join(meta.ResponseKeys, ",") != "district,group_name,rent_vnd" {
+		t.Fatalf("keys=%v err=%v", meta.ResponseKeys, err)
+	}
+	for _, key := range meta.ResponseKeys {
+		if strings.Contains(key, "secret") {
+			t.Fatalf("raw source leaked through response keys: %v", meta.ResponseKeys)
+		}
+	}
+}
+
+func TestOpenAIRequestStillUsesStrictJSONSchema(t *testing.T) {
+	var responseFormat map[string]any
+	content, _ := json.Marshal(canonicalEnrichmentTemplate())
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var request struct {
+			ResponseFormat map[string]any `json:"response_format"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&request)
+		responseFormat = request.ResponseFormat
+		_ = json.NewEncoder(w).Encode(map[string]any{"choices": []any{map[string]any{"message": map[string]any{"content": string(content)}}}})
+	}))
+	defer srv.Close()
+	_, err := New(Config{Provider: "openai", BaseURL: srv.URL, APIKey: "x", Model: "strict"}).Enrich(context.Background(), "rental source", domain.Listing{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if responseFormat["type"] != "json_schema" {
+		t.Fatalf("response_format=%v", responseFormat)
+	}
+	schemaConfig, ok := responseFormat["json_schema"].(map[string]any)
+	if !ok || schemaConfig["strict"] != true {
+		t.Fatalf("strict json_schema missing: %v", responseFormat)
+	}
+}
+
 func TestCompatibleDropsUnknownTopLevelAndNestedFields(t *testing.T) {
 	content := `{
 		"is_rental_listing":true,

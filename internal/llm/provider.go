@@ -10,6 +10,7 @@ import (
 	"math"
 	"net"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -49,6 +50,7 @@ type CallMeta struct {
 	Model, Provider           string
 	Latency                   time.Duration
 	InputTokens, OutputTokens int
+	ResponseKeys              []string
 }
 type HTTPError struct {
 	Status     int
@@ -261,10 +263,14 @@ func (p *OpenAICompatible) EnrichDetailed(ctx context.Context, originalText stri
 		// Missing nullable fields are canonicalized locally before validation.
 		responseFormat = map[string]any{"type": "json_object"}
 	}
+	systemPrompt := "Extract structured facts from Da Nang rental ads in Vietnamese, English, Russian or mixed text. Return only schema JSON. NEVER INFER FACTS NOT SUPPORTED BY THE POST. Unknown values are null. Convert rental notation to integer VND; distinguish current rent from old price, deposit, utilities and surcharges. Preserve stated location. district must be the schema enum; use Unknown when unsupported."
+	if p.cfg.Provider != "openai" {
+		systemPrompt += "\n\n" + compatibleSchemaInstructions()
+	}
 	body := map[string]any{
 		"model": p.cfg.Model,
 		"messages": []map[string]string{
-			{"role": "system", "content": "Extract structured facts from Da Nang rental ads in Vietnamese, English, Russian or mixed text. Return only schema JSON. NEVER INFER FACTS NOT SUPPORTED BY THE POST. Unknown values are null. Convert rental notation to integer VND; distinguish current rent from old price, deposit, utilities and surcharges. Preserve stated location. district must be the schema enum; use Unknown when unsupported."},
+			{"role": "system", "content": systemPrompt},
 			{"role": "user", "content": prompt},
 		},
 		"response_format": responseFormat,
@@ -279,6 +285,7 @@ func (p *OpenAICompatible) EnrichDetailed(ctx context.Context, originalText stri
 	if err != nil {
 		return domain.Enrichment{}, meta, err
 	}
+	meta.ResponseKeys = topLevelJSONKeys(content)
 	normalized, err := normalizeEnrichmentJSON([]byte(content), p.cfg.Provider != "openai")
 	if err != nil {
 		return domain.Enrichment{}, meta, err
@@ -298,6 +305,53 @@ func (p *OpenAICompatible) EnrichDetailed(ctx context.Context, originalText stri
 		}
 	}
 	return out, meta, nil
+}
+
+func compatibleSchemaInstructions() string {
+	template, _ := json.Marshal(canonicalEnrichmentTemplate())
+	return "COMPATIBLE JSON_OBJECT CANONICAL CONTRACT: Use exactly the field names in the template and never invent extra keys. ALWAYS include \"is_rental_listing\"; it MUST be boolean true or false and must never be omitted. Unknown scalar values are null. property_type is apartment|house|room|studio|null; furnished is full|partial|none|null; district must use the canonical enum or Unknown. Confidence values are numbers from 0 to 1; use 0 when unknown. Return one JSON object matching this canonical template: " + string(template)
+}
+
+func canonicalEnrichmentTemplate() map[string]any {
+	template := make(map[string]any, len(enrichmentKeys()))
+	schema := enrichmentSchema()
+	properties, _ := schema["properties"].(map[string]any)
+	for _, key := range enrichmentKeys() {
+		switch key {
+		case "is_rental_listing":
+			template[key] = false
+		case "district":
+			template[key] = domain.DistrictUnknown
+		case "utilities", "amenities", "restrictions", "confidence":
+			nested := map[string]any{}
+			definition, _ := properties[key].(map[string]any)
+			nestedProperties, _ := definition["properties"].(map[string]any)
+			for nestedKey := range nestedProperties {
+				if key == "confidence" {
+					nested[nestedKey] = 0
+				} else {
+					nested[nestedKey] = nil
+				}
+			}
+			template[key] = nested
+		default:
+			template[key] = nil
+		}
+	}
+	return template
+}
+
+func topLevelJSONKeys(content string) []string {
+	var object map[string]json.RawMessage
+	if json.Unmarshal([]byte(content), &object) != nil {
+		return nil
+	}
+	keys := make([]string, 0, len(object))
+	for key := range object {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	return keys
 }
 
 // AvailableModels returns the model IDs advertised by an OpenAI-compatible endpoint.

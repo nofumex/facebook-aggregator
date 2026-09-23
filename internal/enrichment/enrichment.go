@@ -115,6 +115,7 @@ func (s *Service) Apply(ctx context.Context, l domain.Listing) (domain.Listing, 
 			if err == nil {
 				err = ValidateAgainst(result, l)
 			}
+			s.logResponseShape(l.FacebookPostID, model, err, meta.ResponseKeys)
 			s.log.Info("LLM extraction attempt", "facebook_post_id", l.FacebookPostID, "model", model, "model_index", modelIndex+1, "attempt", retry+1, "latency_ms", meta.Latency.Milliseconds(), "valid", err == nil, "fallback_reason", errorText(err), "input_tokens", meta.InputTokens, "output_tokens", meta.OutputTokens)
 			if err == nil {
 				return s.saveSuccess(ctx, l, hash, result, meta, model)
@@ -162,6 +163,7 @@ func (s *Service) Apply(ctx context.Context, l domain.Listing) (domain.Listing, 
 			if err == nil {
 				err = ValidateAgainst(result, l)
 			}
+			s.logResponseShape(l.FacebookPostID, autoModel, err, meta.ResponseKeys)
 			s.log.Info("LLM extraction auto router attempt", "facebook_post_id", l.FacebookPostID, "model", autoModel, "attempt", 1, "latency_ms", meta.Latency.Milliseconds(), "valid", err == nil, "fallback_reason", errorText(err), "input_tokens", meta.InputTokens, "output_tokens", meta.OutputTokens)
 			if err == nil {
 				return s.saveSuccess(ctx, l, hash, result, meta, autoModel)
@@ -174,6 +176,12 @@ func (s *Service) Apply(ctx context.Context, l domain.Listing) (domain.Listing, 
 		}
 	}
 	return failed(l, s.cfg.SchemaVersion), false, last
+}
+
+func (s *Service) logResponseShape(postID, model string, err error, keys []string) {
+	if err != nil && strings.Contains(err.Error(), "missing is_rental_listing") {
+		s.log.Debug("LLM response missing rental flag", "facebook_post_id", postID, "model", model, "response_keys", keys)
+	}
 }
 
 func (s *Service) saveSuccess(ctx context.Context, l domain.Listing, hash [32]byte, result domain.Enrichment, meta llm.CallMeta, model string) (domain.Listing, bool, error) {
