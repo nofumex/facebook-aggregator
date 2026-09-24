@@ -53,7 +53,10 @@ func (s *Service) Trigger(groupID int64) bool {
 // ForceSyncAll bypasses next_poll_at for every enabled group. maxPosts applies
 // only to this recovery pass; normal incremental polling remains unchanged.
 func (s *Service) ForceSyncAll(ctx context.Context, maxPosts int) (int, error) {
-	groups, err := s.store.ForceEnabledGroups(ctx)
+	// Do not make groups due here. Doing so lets the polling ticker race the
+	// recovery triggers and start an uncapped sync before the maxPosts pass.
+	// Explicit triggers already bypass next_poll_at.
+	groups, err := s.store.EnabledGroups(ctx)
 	if err != nil {
 		return 0, err
 	}

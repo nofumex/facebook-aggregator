@@ -104,12 +104,6 @@ func (s *Store) EnabledGroups(ctx context.Context) ([]domain.Group, error) {
 	}
 	return out, rows.Err()
 }
-func (s *Store) ForceEnabledGroups(ctx context.Context) ([]domain.Group, error) {
-	if _, err := s.DB.Exec(ctx, "UPDATE fb_groups SET next_poll_at=now(),updated_at=now() WHERE enabled"); err != nil {
-		return nil, err
-	}
-	return s.EnabledGroups(ctx)
-}
 func (s *Store) Group(ctx context.Context, id int64) (domain.Group, error) {
 	return scanGroup(s.DB.QueryRow(ctx, "SELECT "+groupCols+" FROM fb_groups WHERE id=$1", id))
 }
