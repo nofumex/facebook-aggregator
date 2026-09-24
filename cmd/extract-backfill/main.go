@@ -23,7 +23,14 @@ import (
 
 func main() {
 	batch := flag.Int("batch", 100, "listings per resumable batch")
+	limit := flag.Int("limit", 0, "maximum listings to process in total (0 = unlimited)")
 	flag.Parse()
+	if *batch < 1 {
+		fatal(fmt.Errorf("-batch must be at least 1"))
+	}
+	if *limit < 0 {
+		fatal(fmt.Errorf("-limit must be 0 or greater"))
+	}
 	_ = godotenv.Load()
 	cfg, err := config.Load()
 	if err != nil {
@@ -46,8 +53,13 @@ func main() {
 	extractor := enrichment.New(cfg.Extraction, store, log)
 	engine := ranking.NewWithConfig(store.RankingConfig(ctx))
 	var cursor int64
+	processed := 0
 	for {
-		items, e := store.ExtractionBackfillBatch(ctx, cfg.Extraction.SchemaVersion, cursor, *batch)
+		batchSize := nextBatchSize(*batch, *limit, processed)
+		if batchSize == 0 {
+			break
+		}
+		items, e := store.ExtractionBackfillBatch(ctx, cfg.Extraction.SchemaVersion, cursor, batchSize)
 		if e != nil {
 			fatal(e)
 		}
@@ -76,8 +88,24 @@ func main() {
 				log.Error("backfill save failed", "listing_id", l.ID, "error", e)
 			}
 		})
+		processed += len(items)
 		log.Info("backfill batch complete", "cursor", cursor, "processed", len(items), "failures", failures.Load())
 	}
-	log.Info("backfill complete", "schema_version", cfg.Extraction.SchemaVersion)
+	log.Info("backfill complete", "schema_version", cfg.Extraction.SchemaVersion, "processed_total", processed, "limit", *limit)
 }
+
+func nextBatchSize(batch, limit, processed int) int {
+	if limit == 0 {
+		return batch
+	}
+	remaining := limit - processed
+	if remaining <= 0 {
+		return 0
+	}
+	if remaining < batch {
+		return remaining
+	}
+	return batch
+}
+
 func fatal(err error) { fmt.Fprintln(os.Stderr, err); os.Exit(1) }

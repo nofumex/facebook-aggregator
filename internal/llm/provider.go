@@ -10,6 +10,7 @@ import (
 	"math"
 	"net"
 	"net/http"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -413,6 +414,11 @@ func normalizeEnrichmentJSON(raw []byte, compatibleJSONMode bool) ([]byte, error
 			return nil, fmt.Errorf("invalid enrichment JSON: unknown field %s", key)
 		}
 	}
+	if compatibleJSONMode {
+		if err := sanitizeCompatibleEnrichment(object); err != nil {
+			return nil, fmt.Errorf("invalid enrichment JSON: %w", err)
+		}
+	}
 	if _, ok := object["is_rental_listing"]; !ok {
 		if !compatibleJSONMode || !inferRentalListing(object) {
 			return nil, fmt.Errorf("invalid enrichment JSON: missing is_rental_listing")
@@ -452,6 +458,135 @@ func normalizeEnrichmentJSON(raw []byte, compatibleJSONMode bool) ([]byte, error
 		return nil, fmt.Errorf("invalid confidence: %w", err)
 	}
 	return json.Marshal(object)
+}
+
+// sanitizeCompatibleEnrichment applies the existing canonical JSON schema to
+// loosely typed json_object output. Optional values with an unusable type are
+// discarded; the required rental classification is never coerced.
+func sanitizeCompatibleEnrichment(object map[string]json.RawMessage) error {
+	schema := enrichmentSchema()
+	properties, _ := schema["properties"].(map[string]any)
+	for key, raw := range object {
+		definition, ok := properties[key].(map[string]any)
+		if !ok {
+			continue
+		}
+		if key == "is_rental_listing" {
+			if _, valid := sanitizeCompatibleValue(raw, definition, false); !valid {
+				return fmt.Errorf("is_rental_listing must be boolean")
+			}
+			continue
+		}
+		if key == "district" {
+			var district string
+			if json.Unmarshal(raw, &district) != nil {
+				object[key] = json.RawMessage(`"Unknown"`)
+				continue
+			}
+			district = domain.NormalizeDistrict(district)
+			if district == "" {
+				district = domain.DistrictUnknown
+			}
+			normalized, _ := json.Marshal(district)
+			object[key] = normalized
+			continue
+		}
+		zeroInvalid := key == "confidence"
+		if normalized, valid := sanitizeCompatibleValue(raw, definition, zeroInvalid); valid {
+			object[key] = normalized
+		} else if schemaHasType(definition, "object") {
+			object[key] = json.RawMessage(`{}`)
+		} else {
+			object[key] = json.RawMessage("null")
+		}
+	}
+	return nil
+}
+
+func sanitizeCompatibleValue(raw json.RawMessage, definition map[string]any, zeroInvalid bool) (json.RawMessage, bool) {
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.UseNumber()
+	var value any
+	if decoder.Decode(&value) != nil {
+		return nil, false
+	}
+	if value == nil {
+		if schemaHasType(definition, "null") {
+			return json.RawMessage("null"), true
+		}
+		return nil, false
+	}
+	valid := false
+	switch typed := value.(type) {
+	case bool:
+		valid = schemaHasType(definition, "boolean")
+	case string:
+		valid = schemaHasType(definition, "string") && schemaAllowsEnum(definition, typed)
+	case json.Number:
+		if schemaHasType(definition, "integer") {
+			_, err := typed.Int64()
+			valid = err == nil
+		} else if schemaHasType(definition, "number") {
+			_, err := typed.Float64()
+			valid = err == nil
+		}
+	case map[string]any:
+		if !schemaHasType(definition, "object") {
+			break
+		}
+		properties, _ := definition["properties"].(map[string]any)
+		normalized := map[string]json.RawMessage{}
+		for key, child := range typed {
+			childDefinition, known := properties[key].(map[string]any)
+			if !known {
+				continue
+			}
+			childRaw, _ := json.Marshal(child)
+			if clean, ok := sanitizeCompatibleValue(childRaw, childDefinition, zeroInvalid); ok {
+				normalized[key] = clean
+			} else if zeroInvalid {
+				normalized[key] = json.RawMessage("0")
+			} else {
+				normalized[key] = json.RawMessage("null")
+			}
+		}
+		encoded, _ := json.Marshal(normalized)
+		return encoded, true
+	}
+	if !valid {
+		return nil, false
+	}
+	encoded, _ := json.Marshal(value)
+	return encoded, true
+}
+
+func schemaHasType(definition map[string]any, wanted string) bool {
+	switch types := definition["type"].(type) {
+	case string:
+		return types == wanted
+	case []string:
+		return slices.Contains(types, wanted)
+	case []any:
+		for _, value := range types {
+			if value == wanted {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func schemaAllowsEnum(definition map[string]any, value string) bool {
+	values, constrained := definition["enum"].([]any)
+	if !constrained {
+		return true
+	}
+	for _, allowed := range values {
+		if allowed == value {
+			return true
+		}
+	}
+	return false
 }
 
 // inferRentalListing is deliberately conservative. A monthly rent value must

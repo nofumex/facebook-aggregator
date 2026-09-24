@@ -97,7 +97,7 @@ docker run --rm --env-file .env --entrypoint /usr/local/bin/extract-backfill fac
 docker compose run --rm --entrypoint /usr/local/bin/extract-backfill bot -batch 100
 ```
 
-The image contains both `bot` and `extract-backfill`. The command selects only missing/failed/outdated versions, uses a fixed `BACKFILL_CONCURRENCY` worker pool across cache/LLM/benchmark/update work, saves every batch, and recalculates scores. It is safe to restart. The bot also retries due rows automatically using `EXTRACTION_RETRY_INTERVAL`/`EXTRACTION_RETRY_BATCH`; per-row attempts and `next_extraction_retry_at` prevent hot loops. When the API is unavailable, deterministic data is retained and the row remains eligible for a later retry.
+The image contains both `bot` and `extract-backfill`. Add `-limit 5` to process at most five listings total while keeping `-batch` as the database batch size. The command selects only missing/failed/outdated versions, uses a fixed `BACKFILL_CONCURRENCY` worker pool across cache/LLM/benchmark/update work, saves every batch, and recalculates scores. It is safe to restart. The bot also retries due rows automatically using `EXTRACTION_RETRY_INTERVAL`/`EXTRACTION_RETRY_BATCH`; per-row attempts and `next_extraction_retry_at` prevent hot loops. When the API is unavailable, deterministic data is retained and the row remains eligible for a later retry.
 
 Managed PostgreSQL/session poolers default to `DB_MAX_CONNS=5` and `DB_MIN_CONNS=1`; raise these only within the provider's connection budget. Background reranking uses `RERANK_INTERVAL` and `RERANK_BATCH`, updating the oldest `ranked_at` rows incrementally.
 

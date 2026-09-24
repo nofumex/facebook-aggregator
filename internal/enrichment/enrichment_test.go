@@ -186,7 +186,7 @@ func TestNetworkErrorRetriesSameModel(t *testing.T) {
 	}
 }
 
-func TestInvalidEnumFallsBackWithoutSameModelRetry(t *testing.T) {
+func TestInvalidRangeFallsBackWithoutSameModelRetry(t *testing.T) {
 	calls := map[string]int{}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/models" {
@@ -202,7 +202,7 @@ func TestInvalidEnumFallsBackWithoutSameModelRetry(t *testing.T) {
 		if req.Model == "light" {
 			var obj map[string]any
 			_ = json.Unmarshal([]byte(content), &obj)
-			obj["district"] = "My An"
+			obj["rent_vnd"] = 999
 			b, _ := json.Marshal(obj)
 			content = string(b)
 		}
@@ -226,7 +226,7 @@ func TestConfiguredAutoRouterFallback(t *testing.T) {
 	}{
 		{name: "available after provider failure", availableAuto: true, wantAutoCalls: 1, wantSuccess: true},
 		{name: "unavailable", availableAuto: false, wantAutoCalls: 0, wantSuccess: false},
-		{name: "not used after semantic validation failure", availableAuto: true, explicitBody: `{"choices":[{"message":{"content":"{\"is_rental_listing\":true,\"district\":\"invalid\"}"}}]}`, wantAutoCalls: 0, wantSuccess: false},
+		{name: "not used after semantic validation failure", availableAuto: true, explicitBody: `{"choices":[{"message":{"content":"{\"is_rental_listing\":true,\"rent_vnd\":999}"}}]}`, wantAutoCalls: 0, wantSuccess: false},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {

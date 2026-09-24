@@ -218,15 +218,105 @@ func TestStrictSchemaNormalizationStillRejectsUnknownFields(t *testing.T) {
 	}
 }
 
-func TestCompatibleRejectsImpossibleType(t *testing.T) {
+func TestCompatibleNullsImpossibleOptionalType(t *testing.T) {
 	content := `{"is_rental_listing":true,"bedrooms":"two"}`
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewEncoder(w).Encode(map[string]any{"choices": []any{map[string]any{"message": map[string]any{"content": content}}}})
 	}))
 	defer srv.Close()
-	_, err := New(Config{Provider: "compatible", BaseURL: srv.URL, APIKey: "x", Model: "m"}).Enrich(context.Background(), "x", domain.Listing{})
-	if err == nil {
-		t.Fatal("invalid type accepted")
+	got, err := New(Config{Provider: "compatible", BaseURL: srv.URL, APIKey: "x", Model: "m"}).Enrich(context.Background(), "x", domain.Listing{})
+	if err != nil || got.Bedrooms != nil {
+		t.Fatalf("bedrooms=%v err=%v", got.Bedrooms, err)
+	}
+}
+
+func TestCompatibleSchemaAwareNormalizerProductionShapes(t *testing.T) {
+	content := `{
+		"is_rental_listing":true,
+		"rent_vnd":{"value":6500000},
+		"rent_max_vnd":7000000,
+		"bedrooms":{"value":2},
+		"property_type":{"name":"apartment"},
+		"district":"son tra",
+		"location_original":false,
+		"ward":["An Hai"],
+		"street":123,
+		"address":{"text":"My Khe"},
+		"building":{"name":"Ocean"},
+		"furnished":["full"],
+		"near_beach":"yes",
+		"utilities":{"electricity_vnd_per_kwh":"4000","water_vnd_per_month":100000},
+		"amenities":{"balcony":"yes","elevator":true,"pool":{"available":true}},
+		"restrictions":{"electric_bike_allowed":"unknown"},
+		"confidence":{"rent_vnd":{"score":0.9},"district":0.8,"address":"high"}
+	}`
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"choices": []any{map[string]any{"message": map[string]any{"content": content}}}})
+	}))
+	defer srv.Close()
+	got, err := New(Config{Provider: "compatible", BaseURL: srv.URL, APIKey: "x", Model: "m"}).Enrich(context.Background(), "rental", domain.Listing{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.RentMinVND != nil || got.RentMaxVND == nil || *got.RentMaxVND != 7_000_000 || got.Bedrooms != nil || got.PropertyType != nil {
+		t.Fatalf("numeric/enum normalization failed: %+v", got)
+	}
+	if got.District == nil || *got.District != domain.DistrictSonTra {
+		t.Fatalf("district=%v", got.District)
+	}
+	if got.LocationOriginal != nil || got.Ward != nil || got.Street != nil || got.Address != nil || got.Building != nil {
+		t.Fatalf("location strings were not nulled: %+v", got)
+	}
+	if got.Furnished != nil || got.NearBeach != nil {
+		t.Fatalf("optional enum/bool was not nulled: furnished=%v near_beach=%v", got.Furnished, got.NearBeach)
+	}
+	if got.Confidence["rent_vnd"] != 0 || got.Confidence["address"] != 0 || got.Confidence["district"] != .8 {
+		t.Fatalf("confidence=%v", got.Confidence)
+	}
+	if got.Amenities["balcony"] != nil || got.Amenities["pool"] != nil || got.Amenities["elevator"] != true {
+		t.Fatalf("amenities=%v", got.Amenities)
+	}
+	if got.Utilities["electricity_vnd_per_kwh"] != nil || got.Utilities["water_vnd_per_month"] != float64(100000) {
+		t.Fatalf("utilities=%v", got.Utilities)
+	}
+	if got.Restrictions["electric_bike_allowed"] != nil {
+		t.Fatalf("restrictions=%v", got.Restrictions)
+	}
+}
+
+func TestCompatibleUnknownOrWrongDistrictBecomesUnknown(t *testing.T) {
+	for _, district := range []string{`"Atlantis"`, `{"name":"Son Tra"}`, `42`, `null`} {
+		content := `{"is_rental_listing":true,"district":` + district + `}`
+		normalized, err := normalizeEnrichmentJSON([]byte(content), true)
+		if err != nil {
+			t.Fatalf("district=%s err=%v", district, err)
+		}
+		var got domain.Enrichment
+		if err = json.Unmarshal(normalized, &got); err != nil || got.District == nil || *got.District != domain.DistrictUnknown {
+			t.Fatalf("district=%s got=%+v err=%v", district, got.District, err)
+		}
+	}
+}
+
+func TestCompatibleStillRejectsUnsafeRentalFlagAndMalformedJSON(t *testing.T) {
+	for _, content := range []string{`{"is_rental_listing":"true","rent_vnd":6500000}`, `{"is_rental_listing":{"value":true}}`, `{`} {
+		if _, err := normalizeEnrichmentJSON([]byte(content), true); err == nil {
+			t.Fatalf("accepted unsafe response %s", content)
+		}
+	}
+}
+
+func TestStrictModeDoesNotSanitizeWrongOptionalTypes(t *testing.T) {
+	content := canonicalEnrichmentTemplate()
+	content["address"] = map[string]any{"text": "My Khe"}
+	content["confidence"] = map[string]any{"address": map[string]any{"score": .9}}
+	raw, _ := json.Marshal(content)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"choices": []any{map[string]any{"message": map[string]any{"content": string(raw)}}}})
+	}))
+	defer srv.Close()
+	if _, err := New(Config{Provider: "openai", BaseURL: srv.URL, APIKey: "x", Model: "strict"}).Enrich(context.Background(), "rental", domain.Listing{}); err == nil {
+		t.Fatal("strict mode sanitized invalid optional fields")
 	}
 }
 
