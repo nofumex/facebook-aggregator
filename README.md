@@ -113,7 +113,9 @@ Use a dedicated Facebook account with membership only in the groups the service 
 4. Restrict the file (`chmod 600 .env` on Linux), never commit it, and restart the bot.
 5. Run `go run ./cmd/fbcheck -group <id-or-slug>` before enabling many groups.
 
-`xs` is the primary session credential and grants the effective access of that logged-in session. Never paste cookies into ordinary Telegram chats or logs. Logging out, changing a password, Facebook checkpoints, or “log out all sessions” can invalidate them. When auth expires the adapter classifies it separately, each group records the error, backoff is applied, and the other groups continue. Replace the values in `.env` and restart.
+`xs` is the primary session credential and grants the effective access of that logged-in session. Never paste cookies into ordinary Telegram chats or logs. Logging out, changing a password, Facebook checkpoints, or “log out all sessions” can invalidate them. When auth expires the adapter classifies it separately, each group records the error, backoff is applied, and the other groups continue.
+
+On a recognized expired/invalid session, Telegram sends each configured admin one alert with **Вставить новые Cookie** and suppresses duplicate alerts until recovery. Paste the whitespace/tabular cookie table copied from DevTools; the bot immediately deletes that Telegram message, validates the new session, stores the canonical cookie set encrypted as `facebook.cookies`, and hot-swaps the adapter without a restart. It then bypasses `next_poll_at` and queues every enabled group immediately. This recovery pass keeps the normal cursor/overlap but caps each group at the latest 50 posts; subsequent polls return to the ordinary incremental mode. `SETTINGS_ENCRYPTION_KEY` is required for this flow.
 
 The supplied `.gitignore` and `.dockerignore` exclude `.env`. A Telegram message containing an LLM API key is deleted immediately, then the key is AES-256-GCM encrypted in PostgreSQL using `SETTINGS_ENCRYPTION_KEY` and is never displayed back. If that key is not configured, secret updates through the admin UI are rejected.
 

@@ -237,3 +237,90 @@ func TestPhotoURLsKeepsFacebookImagesOnly(t *testing.T) {
 		t.Fatalf("photos=%v", got)
 	}
 }
+
+func TestFacebookAuthAlertIsSentOnceWhilePending(t *testing.T) {
+	var mu sync.Mutex
+	var calls []map[string]any
+	notified := make(chan struct{}, 2)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		mu.Lock()
+		calls = append(calls, body)
+		mu.Unlock()
+		notified <- struct{}{}
+		_, _ = io.WriteString(w, `{"ok":true,"result":{"message_id":1}}`)
+	}))
+	defer srv.Close()
+	b := testBot(srv)
+	b.admins[42] = true
+	b.NotifyFacebookAuthentication(nil)
+	b.NotifyFacebookAuthentication(nil)
+	select {
+	case <-notified:
+	case <-time.After(time.Second):
+		t.Fatal("auth alert was not sent")
+	}
+	time.Sleep(20 * time.Millisecond)
+	mu.Lock()
+	defer mu.Unlock()
+	if len(calls) != 1 {
+		t.Fatalf("alerts=%d", len(calls))
+	}
+	raw, _ := json.Marshal(calls[0]["reply_markup"])
+	if !strings.Contains(string(raw), "fbcookies") || !strings.Contains(calls[0]["text"].(string), "Facebook") {
+		t.Fatalf("alert=%v", calls[0])
+	}
+}
+
+func TestCookieMessageDeletedThenUpdaterRuns(t *testing.T) {
+	var mu sync.Mutex
+	var paths []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		paths = append(paths, r.URL.Path)
+		mu.Unlock()
+		_, _ = io.WriteString(w, `{"ok":true,"result":{"message_id":1}}`)
+	}))
+	defer srv.Close()
+	b := testBot(srv)
+	b.admins[42] = true
+	b.cookieAlertPending = true
+	secret := "c_user 123\nxs secret-value"
+	called := false
+	b.SetFacebookCookieUpdater(func(_ context.Context, raw string) (int, error) {
+		called = true
+		if raw != secret {
+			t.Fatal("cookie input changed")
+		}
+		return 3, nil
+	})
+	b.handleState(context.Background(), &Message{MessageID: 9, From: User{ID: 42}, Chat: Chat{ID: 42}, Text: secret}, "facebook.cookies")
+	mu.Lock()
+	defer mu.Unlock()
+	if !called || strings.Join(paths, ",") != "/deleteMessage,/sendMessage" || b.cookieAlertPending {
+		t.Fatalf("called=%v paths=%v pending=%v", called, paths, b.cookieAlertPending)
+	}
+}
+
+func TestCookieUpdaterDoesNotRunWhenSecretMessageCannotBeDeleted(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/deleteMessage" {
+			_, _ = io.WriteString(w, `{"ok":false,"description":"delete denied"}`)
+			return
+		}
+		_, _ = io.WriteString(w, `{"ok":true,"result":{"message_id":1}}`)
+	}))
+	defer srv.Close()
+	b := testBot(srv)
+	b.admins[42] = true
+	called := false
+	b.SetFacebookCookieUpdater(func(context.Context, string) (int, error) {
+		called = true
+		return 0, nil
+	})
+	b.handleState(context.Background(), &Message{MessageID: 9, From: User{ID: 42}, Chat: Chat{ID: 42}, Text: "xs secret"}, "facebook.cookies")
+	if called || b.states[42] != "facebook.cookies" {
+		t.Fatalf("called=%v state=%q", called, b.states[42])
+	}
+}

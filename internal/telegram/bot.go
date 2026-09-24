@@ -27,20 +27,22 @@ import (
 )
 
 type Bot struct {
-	api         *Client
-	store       *storage.Store
-	sync        *syncer.Service
-	fb          fbadapter.Adapter
-	collections *collections.Service
-	rates       exchange.Provider
-	admins      map[int64]bool
-	cipher      *secrets.Cipher
-	log         *slog.Logger
-	defaultPoll time.Duration
-	mu          sync.Mutex
-	states      map[int64]string
-	filters     map[int64]domain.SearchFilter
-	pages       map[string]pageCache
+	api                *Client
+	store              *storage.Store
+	sync               *syncer.Service
+	fb                 fbadapter.Adapter
+	collections        *collections.Service
+	rates              exchange.Provider
+	admins             map[int64]bool
+	cipher             *secrets.Cipher
+	log                *slog.Logger
+	defaultPoll        time.Duration
+	mu                 sync.Mutex
+	cookieAlertPending bool
+	cookieUpdater      func(context.Context, string) (int, error)
+	states             map[int64]string
+	filters            map[int64]domain.SearchFilter
+	pages              map[string]pageCache
 }
 type pageCache struct {
 	items   []domain.Listing
@@ -54,6 +56,32 @@ type pageCache struct {
 
 func NewBot(api *Client, store *storage.Store, sync *syncer.Service, fb fbadapter.Adapter, c *collections.Service, admins map[int64]bool, cipher *secrets.Cipher, log *slog.Logger, poll time.Duration) *Bot {
 	return &Bot{api: api, store: store, sync: sync, fb: fb, collections: c, rates: exchange.NewCBR(), admins: admins, cipher: cipher, log: log, defaultPoll: poll, states: map[int64]string{}, filters: map[int64]domain.SearchFilter{}, pages: map[string]pageCache{}}
+}
+
+func (b *Bot) SetFacebookCookieUpdater(updater func(context.Context, string) (int, error)) {
+	b.mu.Lock()
+	b.cookieUpdater = updater
+	b.mu.Unlock()
+}
+
+// NotifyFacebookAuthentication sends one alert per recovery episode. Repeated
+// auth failures are ignored until a valid replacement has been installed.
+func (b *Bot) NotifyFacebookAuthentication(_ error) {
+	b.mu.Lock()
+	if b.cookieAlertPending {
+		b.mu.Unlock()
+		return
+	}
+	b.cookieAlertPending = true
+	b.mu.Unlock()
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		defer cancel()
+		keyboard := Markup{InlineKeyboard: [][]Button{{cb("Вставить новые Cookie", "fbcookies")}}}
+		for adminID := range b.admins {
+			_, _ = b.api.Send(ctx, adminID, "⚠️ Сессия Facebook истекла или недействительна. Обновите cookies, чтобы восстановить синхронизацию.", keyboard)
+		}
+	}()
 }
 
 func (b *Bot) Run(ctx context.Context) error {
@@ -143,6 +171,11 @@ func (b *Bot) callback(ctx context.Context, q *CallbackQuery) {
 	case "admin":
 		if b.admins[q.From.ID] {
 			b.showAdmin(ctx, q)
+		}
+	case "fbcookies":
+		if b.admins[q.From.ID] {
+			b.setState(q.From.ID, "facebook.cookies")
+			b.editOrSend(ctx, q.Message.Chat.ID, q.Message.MessageID, "Вставьте таблицу cookies из DevTools. Нужны <code>sb</code>, <code>datr</code>, <code>c_user</code>, <code>xs</code>, <code>fr</code>, <code>ps_l</code>, <code>ps_n</code>. Сообщение будет удалено сразу после получения.", back("admin"))
 		}
 	case "agroups":
 		if b.admins[q.From.ID] {
@@ -786,6 +819,35 @@ func (b *Bot) checkLLM(ctx context.Context, q *CallbackQuery) {
 
 func (b *Bot) handleState(ctx context.Context, m *Message, state string) {
 	switch state {
+	case "facebook.cookies":
+		if err := b.api.Delete(ctx, m.Chat.ID, m.MessageID); err != nil {
+			b.setState(m.From.ID, "facebook.cookies")
+			b.send(ctx, m.Chat.ID, "Не удалось удалить сообщение с Cookie. Удалите его вручную и повторите отправку.", back("admin"))
+			return
+		}
+		b.mu.Lock()
+		updater := b.cookieUpdater
+		b.mu.Unlock()
+		if updater == nil {
+			b.setState(m.From.ID, "facebook.cookies")
+			b.send(ctx, m.Chat.ID, "Не удалось обновить Cookie: управление сессией не настроено.", back("admin"))
+			return
+		}
+		groupsQueued, err := updater(ctx, m.Text)
+		if err != nil {
+			b.setState(m.From.ID, "facebook.cookies")
+			b.send(ctx, m.Chat.ID, "Не удалось проверить Cookie. Вставьте таблицу ещё раз.", back("admin"))
+			return
+		}
+		b.mu.Lock()
+		b.cookieAlertPending = false
+		for adminID, pendingState := range b.states {
+			if pendingState == "facebook.cookies" {
+				delete(b.states, adminID)
+			}
+		}
+		b.mu.Unlock()
+		b.send(ctx, m.Chat.ID, fmt.Sprintf("✅ Cookie обновлены. Принудительная синхронизация запущена для %d групп.", groupsQueued), back("admin"))
 	case "add_group":
 		count := 0
 		for _, line := range strings.Split(m.Text, "\n") {

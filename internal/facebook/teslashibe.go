@@ -112,6 +112,9 @@ func (a *TeslaShibe) FetchRecent(ctx context.Context, req FetchRequest) (FetchRe
 			if out.NewestAt.IsZero() || p.CreatedAt.After(out.NewestAt) {
 				out.NewestAt, out.NewestID = p.CreatedAt, p.ID
 			}
+			if req.MaxPosts > 0 && len(out.Posts) >= req.MaxPosts {
+				return out, nil
+			}
 		}
 		if out.ReachedOld || !page.HasNext || page.NextCursor == "" {
 			break
@@ -167,8 +170,11 @@ func classify(err error) error {
 	if err == nil {
 		return nil
 	}
+	message := strings.ToLower(err.Error())
 	switch {
 	case errors.Is(err, groups.ErrInvalidAuth), errors.Is(err, groups.ErrUnauthorized), errors.Is(err, groups.ErrSessionExpired):
+		return fmt.Errorf("%w: %v", ErrAuthentication, err)
+	case strings.Contains(message, "1357001"), strings.Contains(message, "log in to continue"), strings.Contains(message, "not logged in"), strings.Contains(message, "please log in"), strings.Contains(message, "login required"), strings.Contains(message, "session expired"), strings.Contains(message, "invalid session"), strings.Contains(message, "authentication failed"), strings.Contains(message, "oauthexception"):
 		return fmt.Errorf("%w: %v", ErrAuthentication, err)
 	case errors.Is(err, groups.ErrRateLimited):
 		return fmt.Errorf("%w: %v", ErrRateLimited, err)

@@ -20,6 +20,7 @@ type FetchRequest struct {
 	StopPostID string
 	StopBefore time.Time
 	MaxPages   int
+	MaxPosts   int
 	Overlap    time.Duration
 }
 

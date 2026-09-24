@@ -17,31 +17,54 @@ import (
 )
 
 type Service struct {
-	store       *storage.Store
-	fb          fbadapter.Adapter
-	parser      *parser.Parser
-	rank        ranking.Engine
-	extractor   *enrichment.Service
-	log         *slog.Logger
-	concurrency int
-	trigger     chan int64
-	mu          sync.Mutex
-	running     map[int64]bool
+	store        *storage.Store
+	fb           fbadapter.Adapter
+	parser       *parser.Parser
+	rank         ranking.Engine
+	extractor    *enrichment.Service
+	log          *slog.Logger
+	concurrency  int
+	trigger      chan triggerRequest
+	mu           sync.Mutex
+	running      map[int64]bool
+	pendingForce map[int64]int
+}
+
+type triggerRequest struct {
+	groupID  int64
+	maxPosts int
 }
 
 func New(store *storage.Store, fb fbadapter.Adapter, p *parser.Parser, r ranking.Engine, extractor *enrichment.Service, log *slog.Logger, concurrency int) *Service {
 	if concurrency < 1 {
 		concurrency = 1
 	}
-	return &Service{store: store, fb: fb, parser: p, rank: r, extractor: extractor, log: log, concurrency: concurrency, trigger: make(chan int64, 100), running: map[int64]bool{}}
+	return &Service{store: store, fb: fb, parser: p, rank: r, extractor: extractor, log: log, concurrency: concurrency, trigger: make(chan triggerRequest, 100), running: map[int64]bool{}, pendingForce: map[int64]int{}}
 }
 func (s *Service) Trigger(groupID int64) bool {
 	select {
-	case s.trigger <- groupID:
+	case s.trigger <- triggerRequest{groupID: groupID}:
 		return true
 	default:
 		return false
 	}
+}
+
+// ForceSyncAll bypasses next_poll_at for every enabled group. maxPosts applies
+// only to this recovery pass; normal incremental polling remains unchanged.
+func (s *Service) ForceSyncAll(ctx context.Context, maxPosts int) (int, error) {
+	groups, err := s.store.ForceEnabledGroups(ctx)
+	if err != nil {
+		return 0, err
+	}
+	for _, group := range groups {
+		select {
+		case s.trigger <- triggerRequest{groupID: group.ID, maxPosts: maxPosts}:
+		case <-ctx.Done():
+			return 0, ctx.Err()
+		}
+	}
+	return len(groups), nil
 }
 func (s *Service) Run(ctx context.Context) {
 	ticker := time.NewTicker(15 * time.Second)
@@ -51,10 +74,10 @@ func (s *Service) Run(ctx context.Context) {
 		select {
 		case <-ctx.Done():
 			return
-		case id := <-s.trigger:
-			g, err := s.store.Group(ctx, id)
-			if err == nil {
-				s.launch(ctx, sem, g)
+		case request := <-s.trigger:
+			g, err := s.store.Group(ctx, request.groupID)
+			if err == nil && (request.maxPosts == 0 || g.Enabled) {
+				s.launch(ctx, sem, g, request.maxPosts)
 			}
 		case <-ticker.C:
 			groups, err := s.store.DueGroups(ctx, s.concurrency*2)
@@ -63,33 +86,52 @@ func (s *Service) Run(ctx context.Context) {
 				continue
 			}
 			for _, g := range groups {
-				s.launch(ctx, sem, g)
+				s.launch(ctx, sem, g, 0)
 			}
 		}
 	}
 }
-func (s *Service) launch(ctx context.Context, sem chan struct{}, g domain.Group) {
+func (s *Service) launch(ctx context.Context, sem chan struct{}, g domain.Group, maxPosts int) {
 	s.mu.Lock()
 	if s.running[g.ID] {
+		if maxPosts > s.pendingForce[g.ID] {
+			s.pendingForce[g.ID] = maxPosts
+		}
 		s.mu.Unlock()
 		return
 	}
 	s.running[g.ID] = true
 	s.mu.Unlock()
 	go func() {
-		defer func() { s.mu.Lock(); delete(s.running, g.ID); s.mu.Unlock() }()
+		defer func() {
+			s.mu.Lock()
+			pending := s.pendingForce[g.ID]
+			delete(s.pendingForce, g.ID)
+			delete(s.running, g.ID)
+			s.mu.Unlock()
+			if pending > 0 {
+				select {
+				case s.trigger <- triggerRequest{groupID: g.ID, maxPosts: pending}:
+				case <-ctx.Done():
+				}
+			}
+		}()
 		select {
 		case sem <- struct{}{}:
 			defer func() { <-sem }()
 		case <-ctx.Done():
 			return
 		}
-		if _, err := s.SyncGroup(ctx, g); err != nil {
+		if _, err := s.syncGroup(ctx, g, maxPosts); err != nil {
 			s.log.Warn("group sync failed", "group_id", g.ID, "error", err)
 		}
 	}()
 }
 func (s *Service) SyncGroup(ctx context.Context, g domain.Group) (domain.GroupSyncResult, error) {
+	return s.syncGroup(ctx, g, 0)
+}
+
+func (s *Service) syncGroup(ctx context.Context, g domain.Group, maxPosts int) (domain.GroupSyncResult, error) {
 	runID, err := s.store.SyncStarted(ctx, g.ID)
 	if err != nil {
 		return domain.GroupSyncResult{}, err
@@ -111,7 +153,7 @@ func (s *Service) SyncGroup(ctx context.Context, g domain.Group) (domain.GroupSy
 			g.Name = name
 		}
 	}
-	fetched, e := s.fb.FetchRecent(ctx, fbadapter.FetchRequest{GroupID: g.FacebookID, StopPostID: g.LastPostID, StopBefore: timeOrZero(g.LastPostAt), MaxPages: 10, Overlap: 6 * time.Hour})
+	fetched, e := s.fb.FetchRecent(ctx, fetchRequest(g, maxPosts))
 	if e != nil {
 		err = e
 		return result, err
@@ -150,6 +192,9 @@ func (s *Service) SyncGroup(ctx context.Context, g domain.Group) (domain.GroupSy
 		}
 	}
 	return result, nil
+}
+func fetchRequest(g domain.Group, maxPosts int) fbadapter.FetchRequest {
+	return fbadapter.FetchRequest{GroupID: g.FacebookID, StopPostID: g.LastPostID, StopBefore: timeOrZero(g.LastPostAt), MaxPages: 10, MaxPosts: maxPosts, Overlap: 6 * time.Hour}
 }
 func uniquePosts(in []domain.FacebookPost) []domain.FacebookPost {
 	seen := map[string]bool{}

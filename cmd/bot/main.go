@@ -57,15 +57,6 @@ func main() {
 	if e = migrations.Up(ctx, store.DB); e != nil {
 		fatal(e)
 	}
-	var adapter fb.Adapter
-	client, e := fb.NewTeslaShibe(fb.TeslaShibeConfig{Cookies: groups.Cookies{SB: cfg.Facebook.SB, DATR: cfg.Facebook.DATR, CUser: cfg.Facebook.CUser, XS: cfg.Facebook.XS, FR: cfg.Facebook.FR, PSL: cfg.Facebook.PSL, PSN: cfg.Facebook.PSN}, MinRequestGap: cfg.Facebook.MinRequestGap, MaxRetries: cfg.Facebook.MaxRetries, DisableHTTP2: cfg.Facebook.DisableHTTP2, DocIDs: cfg.Facebook.DocIDs})
-	if e != nil {
-		log.Error("facebook adapter unavailable", "error", e)
-		adapter = fb.UnavailableAdapter{Reason: e}
-	} else {
-		adapter = client
-		log.Info("facebook adapter ready", "adapter", adapter.Name())
-	}
 	var cipher *secrets.Cipher
 	if len(cfg.EncryptionKey) > 0 {
 		cipher, e = secrets.New(cfg.EncryptionKey)
@@ -75,6 +66,29 @@ func main() {
 	} else {
 		log.Warn("SETTINGS_ENCRYPTION_KEY missing; secret updates in Telegram admin are disabled")
 	}
+	cookies := groups.Cookies{SB: cfg.Facebook.SB, DATR: cfg.Facebook.DATR, CUser: cfg.Facebook.CUser, XS: cfg.Facebook.XS, FR: cfg.Facebook.FR, PSL: cfg.Facebook.PSL, PSN: cfg.Facebook.PSN}
+	if cipher != nil {
+		if encoded, secretErr := store.Secret(ctx, cipher, "facebook.cookies"); secretErr == nil {
+			if stored, decodeErr := fb.UnmarshalCookies(encoded); decodeErr == nil {
+				cookies = stored
+			} else {
+				log.Warn("stored Facebook cookies ignored", "error", decodeErr)
+			}
+		}
+	}
+	adapterConfig := fb.TeslaShibeConfig{Cookies: cookies, MinRequestGap: cfg.Facebook.MinRequestGap, MaxRetries: cfg.Facebook.MaxRetries, DisableHTTP2: cfg.Facebook.DisableHTTP2, DocIDs: cfg.Facebook.DocIDs}
+	var initialAdapter fb.Adapter
+	initialAuthenticationFailure := false
+	client, e := fb.NewTeslaShibe(adapterConfig)
+	if e != nil {
+		initialAuthenticationFailure = errors.Is(e, fb.ErrAuthentication)
+		log.Error("facebook adapter unavailable", "error", e)
+		initialAdapter = fb.UnavailableAdapter{Reason: e}
+	} else {
+		initialAdapter = client
+		log.Info("facebook adapter ready", "adapter", initialAdapter.Name())
+	}
+	adapter := fb.NewDynamicAdapter(initialAdapter)
 	api := tg.NewClient(cfg.TelegramToken)
 	var bot *tg.Bot
 	provider := func(c context.Context) llm.Provider {
@@ -90,6 +104,59 @@ func main() {
 		return provider(c)
 	}, rankEngine, log)
 	bot = tg.NewBot(api, store, syncService, adapter, collectionService, cfg.AdminIDs, cipher, log, cfg.DefaultPoll)
+	bot.SetFacebookCookieUpdater(func(updateCtx context.Context, raw string) (int, error) {
+		if cipher == nil {
+			return 0, fmt.Errorf("SETTINGS_ENCRYPTION_KEY is required")
+		}
+		newCookies, parseErr := fb.ParseCookies(raw)
+		if parseErr != nil {
+			return 0, parseErr
+		}
+		candidateConfig := adapterConfig
+		candidateConfig.Cookies = newCookies
+		candidate, createErr := fb.NewTeslaShibe(candidateConfig)
+		if createErr != nil {
+			return 0, createErr
+		}
+		checkCtx, cancel := context.WithTimeout(updateCtx, 45*time.Second)
+		enabledGroups, groupsErr := backgroundStore.EnabledGroups(checkCtx)
+		if groupsErr != nil {
+			cancel()
+			return 0, groupsErr
+		}
+		if len(enabledGroups) > 0 {
+			group := enabledGroups[0]
+			if group.FacebookID != "" {
+				if checkErr := candidate.Check(checkCtx, group.FacebookID); checkErr != nil {
+					cancel()
+					return 0, checkErr
+				}
+			} else if _, _, _, resolveErr := candidate.ResolveGroup(checkCtx, group.URL); resolveErr != nil {
+				cancel()
+				return 0, resolveErr
+			}
+		}
+		cancel()
+		encoded, encodeErr := fb.MarshalCookies(newCookies)
+		if encodeErr != nil {
+			return 0, encodeErr
+		}
+		if saveErr := store.SetSecret(updateCtx, cipher, "facebook.cookies", encoded); saveErr != nil {
+			return 0, saveErr
+		}
+		adapter.Replace(candidate)
+		forceCtx, cancelForce := context.WithTimeout(updateCtx, 15*time.Second)
+		defer cancelForce()
+		queued, forceErr := syncService.ForceSyncAll(forceCtx, 50)
+		if forceErr != nil {
+			return 0, forceErr
+		}
+		return queued, nil
+	})
+	adapter.SetAuthenticationHandler(bot.NotifyFacebookAuthentication)
+	if initialAuthenticationFailure {
+		bot.NotifyFacebookAuthentication(fb.ErrAuthentication)
+	}
 	server := healthServer(cfg.HTTPAddr, store)
 	go func() {
 		log.Info("health server listening", "addr", cfg.HTTPAddr)

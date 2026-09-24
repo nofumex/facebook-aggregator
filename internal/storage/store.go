@@ -88,6 +88,28 @@ func (s *Store) DueGroups(ctx context.Context, limit int) ([]domain.Group, error
 	}
 	return out, rows.Err()
 }
+func (s *Store) EnabledGroups(ctx context.Context) ([]domain.Group, error) {
+	rows, err := s.DB.Query(ctx, "SELECT "+groupCols+" FROM fb_groups WHERE enabled ORDER BY id")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []domain.Group
+	for rows.Next() {
+		group, scanErr := scanGroup(rows)
+		if scanErr != nil {
+			return nil, scanErr
+		}
+		out = append(out, group)
+	}
+	return out, rows.Err()
+}
+func (s *Store) ForceEnabledGroups(ctx context.Context) ([]domain.Group, error) {
+	if _, err := s.DB.Exec(ctx, "UPDATE fb_groups SET next_poll_at=now(),updated_at=now() WHERE enabled"); err != nil {
+		return nil, err
+	}
+	return s.EnabledGroups(ctx)
+}
 func (s *Store) Group(ctx context.Context, id int64) (domain.Group, error) {
 	return scanGroup(s.DB.QueryRow(ctx, "SELECT "+groupCols+" FROM fb_groups WHERE id=$1", id))
 }
