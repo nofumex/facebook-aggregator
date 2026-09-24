@@ -99,7 +99,9 @@ docker compose run --rm --entrypoint /usr/local/bin/extract-backfill bot -batch 
 
 The image contains both `bot` and `extract-backfill`. Add `-limit 5` to process at most five listings total while keeping `-batch` as the database batch size. The command selects only missing/failed/outdated versions, uses a fixed `BACKFILL_CONCURRENCY` worker pool across cache/LLM/benchmark/update work, saves every batch, and recalculates scores. It is safe to restart. The bot also retries due rows automatically using `EXTRACTION_RETRY_INTERVAL`/`EXTRACTION_RETRY_BATCH`; per-row attempts and `next_extraction_retry_at` prevent hot loops. When the API is unavailable, deterministic data is retained and the row remains eligible for a later retry.
 
-Managed PostgreSQL/session poolers default to `DB_MAX_CONNS=5` and `DB_MIN_CONNS=1`; raise these only within the provider's connection budget. Background reranking uses `RERANK_INTERVAL` and `RERANK_BATCH`, updating the oldest `ranked_at` rows incrementally.
+Managed PostgreSQL/session poolers default to `DB_MAX_CONNS=5` and `DB_MIN_CONNS=1`; raise these only within the provider's connection budget. The bot partitions that same total budget into a UI pool and a bounded background pool (`DB_BACKGROUND_MAX_CONNS=2` by default), so sync/extraction/reranking/collection refreshes cannot consume Telegram's reserved connections. Background reranking uses `RERANK_INTERVAL` and `RERANK_BATCH`, updating the oldest `ranked_at` rows incrementally.
+
+The 1/7/30-day collections are immutable in-memory snapshots refreshed sequentially in the background. Telegram callbacks only read the latest completed snapshot; reranking and LLM curation never run on the callback path. Configure refresh cadence and a per-period deadline with `COLLECTION_REFRESH_INTERVAL=10m` and `COLLECTION_REFRESH_TIMEOUT=90s`. A failed refresh leaves the previous snapshot available.
 
 ## Facebook cookies
 

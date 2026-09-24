@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"html"
 	"log/slog"
@@ -612,8 +613,30 @@ func (b *Bot) runCollection(ctx context.Context, q *CallbackQuery, p []string) {
 	}
 	items, e := b.collections.Get(ctx, q.From.ID, days)
 	if e != nil {
+		if errors.Is(e, collections.ErrSnapshotNotReady) {
+			b.editOrSend(ctx, q.Message.Chat.ID, q.Message.MessageID, "<b>🔥 Лучшие "+collections.Title(days)+"</b>\n\nПодборка готовится в фоне. Попробуйте открыть её ещё раз через минуту.", back("collections"))
+			return
+		}
 		b.fail(ctx, q.Message.Chat.ID, q.Message.MessageID, e)
 		return
+	}
+	ids := make([]int64, 0, len(items))
+	for _, item := range items {
+		ids = append(ids, item.ID)
+	}
+	visibilityCtx, cancelVisibility := context.WithTimeout(ctx, 300*time.Millisecond)
+	hidden, hiddenErr := b.store.HiddenListingIDs(visibilityCtx, q.From.ID, ids)
+	cancelVisibility()
+	if hiddenErr == nil {
+		visible := items[:0]
+		for _, item := range items {
+			if !hidden[item.ID] {
+				visible = append(visible, item)
+			}
+		}
+		items = visible
+	} else {
+		b.log.Warn("filter collection snapshot visibility", "user_id", q.From.ID, "error", hiddenErr)
 	}
 	list := make([]domain.Listing, 0, len(items))
 	reasons := map[int64]string{}

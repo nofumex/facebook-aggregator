@@ -206,8 +206,8 @@ func (s *Store) Benchmarks(ctx context.Context, l domain.Listing) (ranking.Bench
 	return b, err
 }
 
-// RerankPeriod refreshes stored scores against current comparables before a
-// collection is selected. The bounded pool keeps this safe for interactive use.
+// RerankPeriod is retained for explicit maintenance/backfill operations.
+// Interactive collection callbacks never invoke it.
 func (s *Store) RerankPeriod(ctx context.Context, after time.Time, engine ranking.Engine, batch int) (int, error) {
 	if batch < 1 || batch > 500 {
 		batch = 250
@@ -253,6 +253,26 @@ func scanListing(row pgx.Row) (domain.Listing, error) {
 }
 func (s *Store) Listing(ctx context.Context, id int64) (domain.Listing, error) {
 	return scanListing(s.DB.QueryRow(ctx, listingSelect+" WHERE l.id=$1", id))
+}
+
+func (s *Store) HiddenListingIDs(ctx context.Context, userID int64, listingIDs []int64) (map[int64]bool, error) {
+	hidden := map[int64]bool{}
+	if len(listingIDs) == 0 {
+		return hidden, nil
+	}
+	rows, err := s.DB.Query(ctx, `SELECT listing_id FROM hidden_listings WHERE telegram_user_id=$1 AND listing_id=ANY($2)`, userID, listingIDs)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var id int64
+		if err = rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		hidden[id] = true
+	}
+	return hidden, rows.Err()
 }
 
 func (s *Store) ExtractionBackfillBatch(ctx context.Context, version string, afterID int64, limit int) ([]domain.Listing, error) {

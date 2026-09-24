@@ -10,22 +10,25 @@ import (
 )
 
 type Config struct {
-	DatabaseURL             string
-	TelegramToken           string
-	AdminIDs                map[int64]bool
-	EncryptionKey           []byte
-	HTTPAddr                string
-	DefaultPoll             time.Duration
-	WorkerConcurrency       int
-	DBMaxConns              int
-	DBMinConns              int
-	BackfillConcurrency     int
-	ExtractionRetryInterval time.Duration
-	ExtractionRetryBatch    int
-	RerankInterval          time.Duration
-	RerankBatch             int
-	Facebook                Facebook
-	Extraction              LLMExtraction
+	DatabaseURL               string
+	TelegramToken             string
+	AdminIDs                  map[int64]bool
+	EncryptionKey             []byte
+	HTTPAddr                  string
+	DefaultPoll               time.Duration
+	WorkerConcurrency         int
+	DBMaxConns                int
+	DBMinConns                int
+	DBBackgroundMaxConns      int
+	BackfillConcurrency       int
+	ExtractionRetryInterval   time.Duration
+	ExtractionRetryBatch      int
+	RerankInterval            time.Duration
+	RerankBatch               int
+	CollectionRefreshInterval time.Duration
+	CollectionRefreshTimeout  time.Duration
+	Facebook                  Facebook
+	Extraction                LLMExtraction
 }
 
 type LLMExtraction struct {
@@ -55,8 +58,9 @@ func Load() (Config, error) {
 		DatabaseURL: os.Getenv("DATABASE_URL"), TelegramToken: os.Getenv("TELEGRAM_BOT_TOKEN"),
 		HTTPAddr: env("HTTP_ADDR", ":8080"), DefaultPoll: duration("DEFAULT_POLL_INTERVAL", 5*time.Minute),
 		WorkerConcurrency: integer("SYNC_CONCURRENCY", 3),
-		DBMaxConns:        integer("DB_MAX_CONNS", 5), DBMinConns: integer("DB_MIN_CONNS", 1), BackfillConcurrency: integer("BACKFILL_CONCURRENCY", 2),
+		DBMaxConns:        integer("DB_MAX_CONNS", 5), DBMinConns: integer("DB_MIN_CONNS", 1), DBBackgroundMaxConns: integer("DB_BACKGROUND_MAX_CONNS", 2), BackfillConcurrency: integer("BACKFILL_CONCURRENCY", 2),
 		ExtractionRetryInterval: duration("EXTRACTION_RETRY_INTERVAL", 5*time.Minute), ExtractionRetryBatch: integer("EXTRACTION_RETRY_BATCH", 20), RerankInterval: duration("RERANK_INTERVAL", 15*time.Minute), RerankBatch: integer("RERANK_BATCH", 100),
+		CollectionRefreshInterval: duration("COLLECTION_REFRESH_INTERVAL", 10*time.Minute), CollectionRefreshTimeout: duration("COLLECTION_REFRESH_TIMEOUT", 90*time.Second),
 		Extraction: LLMExtraction{
 			Enabled: boolEnv("LLM_EXTRACTION_ENABLED", false), BaseURL: strings.TrimRight(os.Getenv("LLM_EXTRACTION_BASE_URL"), "/"), APIKey: os.Getenv("LLM_EXTRACTION_API_KEY"),
 			Timeout: duration("LLM_EXTRACTION_TIMEOUT", 25*time.Second), Concurrency: integer("LLM_EXTRACTION_CONCURRENCY", 2), SchemaVersion: env("LLM_EXTRACTION_SCHEMA_VERSION", "rental-v1"),

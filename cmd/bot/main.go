@@ -39,11 +39,21 @@ func main() {
 	log := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	store, e := storage.Open(ctx, cfg.DatabaseURL, cfg.DBMaxConns, cfg.DBMinConns)
+	uiMaxConns, backgroundMaxConns := poolPartition(cfg.DBMaxConns, cfg.DBBackgroundMaxConns)
+	store, e := storage.Open(ctx, cfg.DatabaseURL, uiMaxConns, min(cfg.DBMinConns, uiMaxConns))
 	if e != nil {
 		fatal(e)
 	}
 	defer store.Close()
+	backgroundStore := store
+	if backgroundMaxConns > 0 {
+		backgroundStore, e = storage.Open(ctx, cfg.DatabaseURL, backgroundMaxConns, 0)
+		if e != nil {
+			fatal(e)
+		}
+		defer backgroundStore.Close()
+	}
+	log.Info("database pools ready", "total_max_conns", cfg.DBMaxConns, "ui_max_conns", uiMaxConns, "background_max_conns", backgroundMaxConns)
 	if e = migrations.Up(ctx, store.DB); e != nil {
 		fatal(e)
 	}
@@ -73,10 +83,10 @@ func main() {
 		}
 		return bot.Provider(c)
 	}
-	extractor := enrichment.New(cfg.Extraction, store, log)
-	rankEngine := ranking.NewWithConfig(store.RankingConfig(ctx))
-	syncService := syncer.New(store, adapter, parser.New(), rankEngine, extractor, log, cfg.WorkerConcurrency)
-	collectionService := collections.NewWithRanking(store, func(c context.Context) llm.Provider {
+	extractor := enrichment.New(cfg.Extraction, backgroundStore, log)
+	rankEngine := ranking.NewWithConfig(backgroundStore.RankingConfig(ctx))
+	syncService := syncer.New(backgroundStore, adapter, parser.New(), rankEngine, extractor, log, cfg.WorkerConcurrency)
+	collectionService := collections.NewWithRanking(backgroundStore, func(c context.Context) llm.Provider {
 		return provider(c)
 	}, rankEngine, log)
 	bot = tg.NewBot(api, store, syncService, adapter, collectionService, cfg.AdminIDs, cipher, log, cfg.DefaultPoll)
@@ -89,8 +99,9 @@ func main() {
 		}
 	}()
 	go syncService.Run(ctx)
-	go workers.RunExtractionRetry(ctx, store, extractor, rankEngine, cfg, log)
-	go workers.RunReranking(ctx, store, rankEngine, cfg, log)
+	go workers.RunExtractionRetry(ctx, backgroundStore, extractor, rankEngine, cfg, log)
+	go workers.RunReranking(ctx, backgroundStore, rankEngine, cfg, log)
+	go collectionService.Run(ctx, cfg.CollectionRefreshInterval, cfg.CollectionRefreshTimeout)
 	go func() {
 		if err := bot.Run(ctx); err != nil {
 			log.Error("telegram bot stopped", "error", err)
@@ -103,6 +114,21 @@ func main() {
 	_ = server.Shutdown(shutdownCtx)
 	log.Info("shutdown complete")
 }
+
+func poolPartition(total, requestedBackground int) (ui, background int) {
+	if total < 2 {
+		return 1, 0
+	}
+	background = requestedBackground
+	if background < 1 {
+		background = 1
+	}
+	if background > total-1 {
+		background = total - 1
+	}
+	return total - background, background
+}
+
 func healthServer(addr string, s *storage.Store) *http.Server {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/live", func(w http.ResponseWriter, _ *http.Request) {
