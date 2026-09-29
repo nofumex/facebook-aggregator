@@ -3,23 +3,23 @@ services:
     image: postgres:16-alpine
     restart: unless-stopped
     environment:
-      POSTGRES_DB: facebook_aggregator
+      POSTGRES_DB: telegram_aggregator
       POSTGRES_USER: aggregator
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U aggregator -d facebook_aggregator"]
+      test: ["CMD-SHELL", "pg_isready -U aggregator -d telegram_aggregator"]
       interval: 5s
       timeout: 3s
       retries: 10
   bot:
     build: .
-    image: facebook-aggregator
+    image: telegram-rental-aggregator
     restart: unless-stopped
     env_file: .env
     environment:
-      DATABASE_URL: postgres://aggregator:${POSTGRES_PASSWORD}@postgres:5432/facebook_aggregator?sslmode=disable
+      DATABASE_URL: postgres://aggregator:${POSTGRES_PASSWORD}@postgres:5432/telegram_aggregator?sslmode=disable
     depends_on:
       postgres:
         condition: service_healthy
