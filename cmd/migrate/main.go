@@ -3,10 +3,10 @@ package main
 import (
 	"context"
 	"fmt"
-	"github.com/egori/facebook-aggregator/internal/config"
-	"github.com/egori/facebook-aggregator/internal/storage"
-	"github.com/egori/facebook-aggregator/migrations"
 	"github.com/joho/godotenv"
+	"github.com/nofumex/telegram-aggregator/internal/config"
+	"github.com/nofumex/telegram-aggregator/internal/storage"
+	"github.com/nofumex/telegram-aggregator/migrations"
 	"os"
 )
 

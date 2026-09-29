@@ -1,0 +1,11 @@
+[
+  {"Canonical":"Oceanus","Zone":"north","Aliases":["oceanus","muong thanh vien trieu","mường thanh viễn triều"],"Oceanus":true,"Near":false},
+  {"Canonical":"Vĩnh Phước","Zone":"north","Aliases":["vinh phuoc","vĩnh phước","hon chong","hòn chồng"],"Oceanus":false,"Near":true},
+  {"Canonical":"Vĩnh Hải","Zone":"north","Aliases":["vinh hai","vĩnh hải"],"Oceanus":false,"Near":false},
+  {"Canonical":"Hung Vuong","Zone":"center","Aliases":["hung vuong","hùng vương"],"Oceanus":false,"Near":false},
+  {"Canonical":"Lộc Thọ","Zone":"center","Aliases":["loc tho","lộc thọ","tran phu","trần phú"],"Oceanus":false,"Near":false},
+  {"Canonical":"Phước Long","Zone":"south","Aliases":["phuoc long","phước long"],"Oceanus":false,"Near":false},
+  {"Canonical":"Vĩnh Trường","Zone":"south","Aliases":["vinh truong","vĩnh trường"],"Oceanus":false,"Near":false},
+  {"Canonical":"Phước Hải","Zone":"west","Aliases":["phuoc hai","phước hải"],"Oceanus":false,"Near":false},
+  {"Canonical":"Ha Quang","Zone":"west","Aliases":["ha quang","hà quang"],"Oceanus":false,"Near":false}
+]

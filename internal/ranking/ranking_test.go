@@ -1,7 +1,7 @@
 package ranking
 
 import (
-	"github.com/egori/facebook-aggregator/internal/domain"
+	"github.com/nofumex/telegram-aggregator/internal/domain"
 	"testing"
 	"time"
 )
