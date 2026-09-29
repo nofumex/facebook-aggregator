@@ -5,14 +5,12 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"strings"
 	"sync"
 	"time"
 
-	"github.com/egori/facebook-aggregator/internal/domain"
-	"github.com/egori/facebook-aggregator/internal/llm"
-	"github.com/egori/facebook-aggregator/internal/ranking"
-	"github.com/egori/facebook-aggregator/internal/storage"
+	"github.com/nofumex/telegram-aggregator/internal/domain"
+	"github.com/nofumex/telegram-aggregator/internal/ranking"
+	"github.com/nofumex/telegram-aggregator/internal/storage"
 )
 
 var ErrSnapshotNotReady = errors.New("collection snapshot is not ready")
@@ -27,33 +25,32 @@ type snapshot struct {
 }
 
 // Service serves immutable collection snapshots to Telegram. All database,
-// ranking-dependent selection and optional LLM curation happens in Run.
+// ranking-dependent selection happens in Run.
 type Service struct {
 	store     collectionStore
-	provider  func(context.Context) llm.Provider
 	mu        sync.RWMutex
 	snapshots map[int]snapshot
 	log       *slog.Logger
 }
 
-func New(s *storage.Store, p func(context.Context) llm.Provider) *Service {
-	return newService(s, p, slog.Default())
+func New(s *storage.Store) *Service {
+	return newService(s, slog.Default())
 }
 
 // The ranking argument remains for source compatibility. Scores are maintained
 // by the dedicated reranking worker and are never recalculated here.
-func NewWithRanking(s *storage.Store, p func(context.Context) llm.Provider, _ ranking.Engine, log *slog.Logger) *Service {
-	return newService(s, p, log)
+func NewWithRanking(s *storage.Store, _ ranking.Engine, log *slog.Logger) *Service {
+	return newService(s, log)
 }
 
-func newService(s collectionStore, p func(context.Context) llm.Provider, log *slog.Logger) *Service {
+func newService(s collectionStore, log *slog.Logger) *Service {
 	if log == nil {
 		log = slog.Default()
 	}
-	return &Service{store: s, provider: p, snapshots: map[int]snapshot{}, log: log}
+	return &Service{store: s, snapshots: map[int]snapshot{}, log: log}
 }
 
-// Get is UI-only: it never performs database work, reranking or LLM calls.
+// Get is UI-only: it never performs database work or reranking.
 func (s *Service) Get(_ context.Context, _ int64, days int) ([]domain.CollectionItem, error) {
 	days = normalizedDays(days)
 	s.mu.RLock()
@@ -148,28 +145,11 @@ func (s *Service) build(ctx context.Context, days int) ([]domain.CollectionItem,
 	stats.qualityPassed = len(candidates)
 
 	items := make([]domain.CollectionItem, 0, 15)
-	provider := s.provider(ctx)
-	choices, curateErr := provider.Curate(ctx, candidates, 15)
-	if curateErr == nil && provider.Name() != "disabled" {
-		byID := make(map[int64]domain.Listing, len(candidates))
-		for _, listing := range candidates {
-			byID[listing.ID] = listing
+	for i, listing := range candidates {
+		if i >= 15 {
+			break
 		}
-		for _, choice := range choices {
-			if listing, ok := byID[choice.ListingID]; ok && strings.TrimSpace(choice.Reason) != "" && len(items) < 15 {
-				items = append(items, domain.CollectionItem{Listing: listing, Reason: choice.Reason, Rank: len(items) + 1})
-			}
-		}
-	} else {
-		if curateErr != nil && provider.Name() != "disabled" {
-			s.log.Warn("collection curator failed; using local quality order", "days", days, "error", curateErr)
-		}
-		for i, listing := range candidates {
-			if i >= 15 {
-				break
-			}
-			items = append(items, domain.CollectionItem{Listing: listing, Reason: localReason(listing), Rank: i + 1})
-		}
+		items = append(items, domain.CollectionItem{Listing: listing, Reason: localReason(listing), Rank: i + 1})
 	}
 	return items, stats, nil
 }

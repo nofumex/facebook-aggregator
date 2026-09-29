@@ -7,8 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/egori/facebook-aggregator/internal/domain"
-	"github.com/egori/facebook-aggregator/internal/llm"
+	"github.com/nofumex/telegram-aggregator/internal/domain"
 )
 
 type snapshotStore struct {
@@ -48,7 +47,7 @@ func eligibleListing(id int64) domain.Listing {
 
 func TestGetNeverWaitsForBackgroundRefresh(t *testing.T) {
 	store := &snapshotStore{items: []domain.Listing{eligibleListing(1)}, started: make(chan struct{}), release: make(chan struct{})}
-	svc := newService(store, func(context.Context) llm.Provider { return llm.Disabled{} }, nil)
+	svc := newService(store, nil)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	done := make(chan struct{})
@@ -88,7 +87,7 @@ func TestGetNeverWaitsForBackgroundRefresh(t *testing.T) {
 
 func TestFailedRefreshKeepsLastReadySnapshot(t *testing.T) {
 	store := &snapshotStore{items: []domain.Listing{eligibleListing(10)}}
-	svc := newService(store, func(context.Context) llm.Provider { return llm.Disabled{} }, nil)
+	svc := newService(store, nil)
 	if err := svc.refreshPeriod(context.Background(), 7); err != nil {
 		t.Fatal(err)
 	}
@@ -107,7 +106,7 @@ func TestFailedRefreshKeepsLastReadySnapshot(t *testing.T) {
 
 func TestRefreshInProgressServesPreviousSnapshot(t *testing.T) {
 	store := &snapshotStore{items: []domain.Listing{eligibleListing(10)}}
-	svc := newService(store, func(context.Context) llm.Provider { return llm.Disabled{} }, nil)
+	svc := newService(store, nil)
 	if err := svc.refreshPeriod(context.Background(), 7); err != nil {
 		t.Fatal(err)
 	}
@@ -133,28 +132,5 @@ func TestRefreshInProgressServesPreviousSnapshot(t *testing.T) {
 	items, err = svc.Get(context.Background(), 1, 7)
 	if err != nil || len(items) != 1 || items[0].ID != 20 {
 		t.Fatalf("updated items=%+v err=%v", items, err)
-	}
-}
-
-type curator struct{}
-
-func (curator) Curate(context.Context, []domain.Listing, int) ([]llm.Choice, error) {
-	return []llm.Choice{{ListingID: 2, Reason: "verified by curator"}}, nil
-}
-func (curator) Enrich(context.Context, string, domain.Listing) (domain.Enrichment, error) {
-	return domain.Enrichment{}, nil
-}
-func (curator) Check(context.Context) error { return nil }
-func (curator) Name() string                { return "test-curator" }
-
-func TestBackgroundBuildPreservesLLMCuration(t *testing.T) {
-	store := &snapshotStore{items: []domain.Listing{eligibleListing(1), eligibleListing(2)}}
-	svc := newService(store, func(context.Context) llm.Provider { return curator{} }, nil)
-	if err := svc.refreshPeriod(context.Background(), 30); err != nil {
-		t.Fatal(err)
-	}
-	items, err := svc.Get(context.Background(), 42, 30)
-	if err != nil || len(items) != 1 || items[0].ID != 2 || items[0].Reason != "verified by curator" {
-		t.Fatalf("items=%+v err=%v", items, err)
 	}
 }
