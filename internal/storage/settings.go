@@ -4,9 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"github.com/egori/facebook-aggregator/internal/ranking"
-	"github.com/egori/facebook-aggregator/internal/secrets"
 	"github.com/jackc/pgx/v5"
+	"github.com/nofumex/telegram-aggregator/internal/ranking"
+	"github.com/nofumex/telegram-aggregator/internal/secrets"
 )
 
 func (s *Store) RankingConfig(ctx context.Context) ranking.RankingConfig {

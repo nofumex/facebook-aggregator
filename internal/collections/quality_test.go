@@ -3,7 +3,7 @@ package collections
 import (
 	"testing"
 
-	"github.com/egori/facebook-aggregator/internal/domain"
+	"github.com/nofumex/telegram-aggregator/internal/domain"
 )
 
 func TestEligibilityRequiresReliableParsedData(t *testing.T) {

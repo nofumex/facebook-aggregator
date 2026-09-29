@@ -4,7 +4,7 @@ import (
 	"math"
 	"time"
 
-	"github.com/egori/facebook-aggregator/internal/domain"
+	"github.com/nofumex/telegram-aggregator/internal/domain"
 )
 
 type Benchmarks struct {
@@ -23,6 +23,34 @@ type RankingConfig struct {
 	CoverageWeights                                                                                                             map[string]float64
 }
 type Engine struct{ Config RankingConfig }
+
+type NhaTrangRankingConfig struct {
+	Base                                                       float64
+	PriceBands                                                 []PriceBand
+	ZoneBonus                                                  map[string]float64
+	ApartmentBonus, StudioBonus                                float64
+	DepositOneMonthBonus, DepositTwoMonthsBonus                float64
+	LeaseThreeMonthsBonus, LeaseSixMonthsBonus, LeaseYearBonus float64
+	OceanusBonus, NearOceanusBonus                             float64
+	OceanusLowPriceSynergy, NearOceanusLowPriceSynergy         float64
+}
+type PriceBand struct {
+	MaxVND int64
+	Bonus  float64
+}
+
+func DefaultNhaTrangConfig() NhaTrangRankingConfig {
+	return NhaTrangRankingConfig{
+		Base:           32,
+		PriceBands:     []PriceBand{{7_000_000, 38}, {8_000_000, 32}, {10_000_000, 24}, {13_000_000, 14}, {16_000_000, 6}},
+		ZoneBonus:      map[string]float64{domain.ZoneNorth: 8, domain.ZoneCenter: 5, domain.ZoneSouth: 2, domain.ZoneWest: 0},
+		ApartmentBonus: 5, StudioBonus: 2,
+		DepositOneMonthBonus: 4, DepositTwoMonthsBonus: 2,
+		LeaseThreeMonthsBonus: 5, LeaseSixMonthsBonus: 3, LeaseYearBonus: 1,
+		OceanusBonus: 8, NearOceanusBonus: 5,
+		OceanusLowPriceSynergy: 10, NearOceanusLowPriceSynergy: 7,
+	}
+}
 
 func DefaultConfig() RankingConfig {
 	return RankingConfig{
@@ -43,6 +71,9 @@ func NewWithConfig(c RankingConfig) Engine { return Engine{Config: c} }
 // Score is deterministic. Relative price components are centered at the
 // comparable median; preferences are separate editable multipliers.
 func (e Engine) Score(l domain.Listing, b Benchmarks, now time.Time) (float64, float64) {
+	if l.City == domain.CityNhaTrang {
+		return ScoreNhaTrang(l, b.SimilarCount, DefaultNhaTrangConfig())
+	}
 	c := e.Config
 	if c.Base == 0 {
 		c = DefaultConfig()
@@ -90,6 +121,62 @@ func (e Engine) Score(l domain.Listing, b Benchmarks, now time.Time) (float64, f
 	return round1(clamp(score, 0, 100)), math.Round(confidence*100) / 100
 }
 
+func ScoreNhaTrang(l domain.Listing, sample int, c NhaTrangRankingConfig) (float64, float64) {
+	if c.Base == 0 {
+		c = DefaultNhaTrangConfig()
+	}
+	score := c.Base
+	if l.RentMin != nil {
+		for _, band := range c.PriceBands {
+			if *l.RentMin <= band.MaxVND {
+				score += band.Bonus
+				break
+			}
+		}
+	}
+	score += c.ZoneBonus[l.Zone]
+	switch l.PropertyType {
+	case "apartment":
+		score += c.ApartmentBonus
+	case "studio":
+		score += c.StudioBonus
+	}
+	if l.RentMin != nil && l.DepositAmount != nil {
+		ratio := float64(*l.DepositAmount) / float64(*l.RentMin)
+		if ratio <= 1 {
+			score += c.DepositOneMonthBonus
+		} else if ratio <= 2 {
+			score += c.DepositTwoMonthsBonus
+		}
+	}
+	if l.LeaseMonths != nil {
+		switch {
+		case *l.LeaseMonths <= 3:
+			score += c.LeaseThreeMonthsBonus
+		case *l.LeaseMonths <= 6:
+			score += c.LeaseSixMonthsBonus
+		case *l.LeaseMonths <= 12:
+			score += c.LeaseYearBonus
+		}
+	}
+	isOceanus := l.IsOceanus != nil && *l.IsOceanus
+	nearOceanus := l.NearOceanus != nil && *l.NearOceanus
+	if isOceanus {
+		score += c.OceanusBonus
+	} else if nearOceanus {
+		score += c.NearOceanusBonus
+	}
+	if l.RentMin != nil && *l.RentMin <= 7_000_000 {
+		if isOceanus {
+			score += c.OceanusLowPriceSynergy
+		} else if nearOceanus {
+			score += c.NearOceanusLowPriceSynergy
+		}
+	}
+	confidence := ScoreConfidence(l, sample)
+	return round1(clamp(score, 0, 100)), math.Round(confidence*100) / 100
+}
+
 // ScoreConfidence = 0.55*weighted field coverage + 0.25*mean known-field
 // extraction confidence + 0.20*log-scaled comparable sample quality.
 func ScoreConfidence(l domain.Listing, sample int) float64 {
@@ -101,7 +188,7 @@ func scoreConfidence(l domain.Listing, sample int, c RankingConfig) float64 {
 		key    string
 		weight float64
 	}
-	fields := []f{{l.RentMin != nil, "price", c.CoverageWeights["price"]}, {l.District != "" && l.District != domain.DistrictUnknown, "district", c.CoverageWeights["district"]}, {l.PropertyType != "", "property_type", c.CoverageWeights["property_type"]}, {l.Bedrooms != nil, "bedrooms", c.CoverageWeights["bedrooms"]}, {l.AreaM2 != nil, "area_m2", c.CoverageWeights["area_m2"]}, {l.Furnished != "", "furnished", c.CoverageWeights["furnished"]}, {l.LocationOriginal != "" || l.Ward != "" || l.Street != "", "location_original", c.CoverageWeights["location_original"]}}
+	fields := []f{{l.RentMin != nil, "price", c.CoverageWeights["price"]}, {l.District != "" && l.District != domain.DistrictUnknown, "district", c.CoverageWeights["district"]}, {l.PropertyType != "", "property_type", c.CoverageWeights["property_type"]}, {l.Bedrooms != nil, "bedrooms", c.CoverageWeights["bedrooms"]}, {l.AreaM2 != nil, "area_m2", c.CoverageWeights["area_m2"]}, {l.Furnished != "", "furnished", c.CoverageWeights["furnished"]}, {l.LocationOriginal != "" || l.Building != "" || l.Street != "", "location_original", c.CoverageWeights["location_original"]}}
 	coverage, total, quality, n := 0.0, 0.0, 0.0, 0.0
 	for _, x := range fields {
 		total += x.weight

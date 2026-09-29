@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/egori/facebook-aggregator/internal/domain"
+	"github.com/nofumex/telegram-aggregator/internal/domain"
 )
 
 const (
@@ -13,7 +13,7 @@ const (
 	MinimumPriceConfidence = 0.75
 )
 
-// Eligible is the single admission gate shared by local and LLM curation.
+// Eligible is the single admission gate for cached collections.
 // It intentionally prefers a short, trustworthy collection to filling a quota.
 func Eligible(items []domain.Listing) []domain.Listing {
 	out := make([]domain.Listing, 0, len(items))

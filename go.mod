@@ -1,13 +1,13 @@
-module github.com/egori/facebook-aggregator
+module github.com/nofumex/telegram-aggregator
 
 go 1.25.0
 
 toolchain go1.25.13
 
 require (
-	github.com/jackc/pgx/v5 v5.9.2
+	github.com/jackc/pgx/v5 v5.11.0
 	github.com/joho/godotenv v1.5.1
-	github.com/teslashibe/facebook-go v0.0.0
+	golang.org/x/net v0.43.0
 	golang.org/x/text v0.39.0
 )
 
@@ -17,5 +17,3 @@ require (
 	github.com/jackc/puddle/v2 v2.2.2 // indirect
 	golang.org/x/sync v0.21.0 // indirect
 )
-
-replace github.com/teslashibe/facebook-go => ./third_party/facebook-go
